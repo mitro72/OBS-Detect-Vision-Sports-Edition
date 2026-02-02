@@ -4,7 +4,7 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
-#include "ort-model/ONNXRuntimeModel.h"
+//#include "ort-model/ONNXRuntimeModel.h"
 
 namespace edgeyolo_cpp {
 /**

@@ -1,6 +1,20 @@
 # Exclude everything
 /*
+*.old
+*.last
+*.bak
+*.tmp
 
+# build
+build/
+out/
+*.obj
+*.pdb
+*.ilk
+
+# OS / editor
+.vscode/
+.idea/
 # Except for default project files
 !/.github
 !/build-aux

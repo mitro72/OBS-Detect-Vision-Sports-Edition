@@ -2,8 +2,15 @@
 #define FILTERDATA_H
 
 #include <obs-module.h>
-#include "ort-model/ONNXRuntimeModel.h"
+#include "ort-model/types.hpp"
 #include "sort/Sort.h"
+#include <algorithm>
+#include <cmath>
+#include <vector>
+#include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
+#include "models/IDetectorModel.h"
+
 
 /**
   * @brief The filter_data struct
@@ -60,8 +67,9 @@ struct filter_data {
 	std::mutex inputBGRALock;
 	std::mutex outputLock;
 	std::mutex modelMutex;
-
-	std::unique_ptr<ONNXRuntimeModel> onnxruntimemodel;
+	// openvino
+	std::unique_ptr<IDetectorModel> model;
+	//std::unique_ptr<ONNXRuntimeModel> onnxruntimemodel;
 	std::vector<std::string> classNames;
 
 #if _WIN32

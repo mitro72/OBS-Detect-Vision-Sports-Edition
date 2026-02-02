@@ -1,15 +1,16 @@
 #include "detect-filter.h"
 
-#include <onnxruntime_cxx_api.h>
-
 #ifdef _WIN32
 #include <wchar.h>
 #include <windows.h>
+#include <util/platform.h>
 #endif // _WIN32
 
 #include <opencv2/imgproc.hpp>
 
 #include <numeric>
+#include <algorithm>
+#include <cmath>
 #include <memory>
 #include <exception>
 #include <fstream>
@@ -26,13 +27,93 @@
 #include "obs-utils/obs-utils.h"
 #include "ort-model/utils.hpp"
 #include "detect-filter-utils.h"
-#include "edgeyolo/edgeyolo_onnxruntime.hpp"
-#include "yunet/YuNet.h"
+#include "models/OpenVINOAdapters.h"
+#include "edgeyolo/coco_names.hpp"
+#include "yunet/YuNetOpenVINO.h"
 
 #define EXTERNAL_MODEL_SIZE "!!!EXTERNAL_MODEL!!!"
 #define FACE_DETECT_MODEL_SIZE "!!!FACE_DETECT!!!"
 
-struct detect_filter : public filter_data {};
+#ifdef _WIN32
+static std::string wide_to_utf8(const std::wstring& w)
+{
+	if (w.empty()) return {};
+	int size = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+	std::string s(size, 0);
+	WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), s.data(), size, nullptr, nullptr);
+	return s;
+}
+#endif
+
+
+
+static inline float smooth_damp_critically_damped(float current, float target, float &currentVelocity,
+						  float smoothTime, float deltaTime)
+{
+	// Based on a critically damped spring (Unity-like SmoothDamp). Stable for variable deltaTime.
+	smoothTime = std::max(0.0001f, smoothTime);
+	const float omega = 2.0f / smoothTime;
+
+	const float x = omega * deltaTime;
+	// Stable approximation of exp(-omega * dt)
+	const float exp = 1.0f / (1.0f + x + 0.48f * x * x + 0.235f * x * x * x);
+
+	const float change = current - target;
+	const float temp = (currentVelocity + omega * change) * deltaTime;
+	currentVelocity = (currentVelocity - omega * temp) * exp;
+
+	const float output = target + (change + temp) * exp;
+	return output;
+}
+
+static inline float smooth_time_from_alpha60(float alpha_per_frame_60fps)
+{
+	// Convert a "lerp alpha per frame at ~60fps" into an equivalent smoothTime (seconds)
+	// for a critically damped spring. This keeps the user-facing "zoomSpeedFactor" feeling similar.
+	const float a = std::clamp(alpha_per_frame_60fps, 0.0f, 0.999999f);
+	if (a <= 0.0f)
+		return 1000000.0f; // effectively frozen
+	const float dt_ref = 1.0f / 60.0f;
+	const float k = -logf(1.0f - a) / dt_ref; // first-order equivalent (1/s)
+	return std::max(0.0001f, 2.0f / k);        // map to spring smoothTime via omega=2/smoothTime
+}
+
+struct detect_filter : public filter_data {
+	// SmoothDamp velocities for trackingRect (x, y, w, h)
+	float trackVelX = 0.0f;
+	float trackVelY = 0.0f;
+	float trackVelW = 0.0f;
+	float trackVelH = 0.0f;
+	int groupMinPeople = 6;
+	bool groupMinPeopleStrict = false;
+	bool previewGroupClusters = false;
+	bool previewGroupClusterLabel = false;
+	// Cache/throttle for group bbox selection (crop)
+	uint64_t lastGroupBoxTsNs = 0;
+	cv::Rect2f lastGroupBox;
+	int lastGroupCount = 0;
+	bool lastGroupBoxValid = false;
+
+	// CPU OPT: inference throttling + caching
+	int infer_interval_ms = 0;          // 0 = disabled (infer every frame)
+	float infer_scale = 1.0f;           // 1.0 = disabled
+	uint64_t last_infer_ts_ns = 0;
+	bool cached_objects_valid = false;
+	std::vector<Object> cached_objects;
+
+	// Horizontal pan preset for group mode: "auto", "left", "center", "right"
+	std::string x_pan_preset = "auto";
+	// Auto-snap state (0=left,1=center,2=right) for "autosnap"
+	int x_snap_state = 1;
+	// Transition time (seconds) for smooth auto-snap movement ("autosnap_smooth")
+	float x_snap_transition_time = 0.25f;
+	// Hysteresis margin for autosnap in normalized units (0..0.2 typical)
+	float x_snap_hysteresis = 0.05f;
+	// Deadband on target X (percent of frame width). 0 disables.
+	float x_deadband = 0.0f;
+	float last_target_zx = 0.0f;
+	bool has_last_target_zx = false;
+};
 
 const char *detect_filter_getname(void *unused)
 {
@@ -233,10 +314,30 @@ obs_properties_t *detect_filter_properties(void *data)
 							      obs_property_t *,
 							      obs_data_t *settings) {
 		const bool enabled = obs_data_get_bool(settings, "tracking_group");
-		for (auto prop_name : {"zoom_factor", "zoom_object", "zoom_speed_factor"}) {
+
+		// Show/hide the core tracking controls when the group is enabled/disabled
+		for (auto prop_name : {"zoom_factor", "zoom_object", "zoom_speed_factor", "x_pan_preset",
+				       "x_snap_hysteresis", "x_snap_transition_time", "x_deadband", "infer_interval_ms", "infer_scale",
+				       "group_min_people", "group_min_people_strict"}) {
 			obs_property_t *prop = obs_properties_get(props_, prop_name);
-			obs_property_set_visible(prop, enabled);
+			if (prop)
+				obs_property_set_visible(prop, enabled);
 		}
+
+		// Cluster preview controls only make sense when ZoomObject == "group"
+		const char *zo = obs_data_get_string(settings, "zoom_object");
+		const bool is_group = (zo && strcmp(zo, "group") == 0);
+
+		obs_property_t *pgc = obs_properties_get(props_, "preview_group_clusters");
+		if (pgc)
+			obs_property_set_visible(pgc, enabled && is_group);
+
+		obs_property_t *lbl = obs_properties_get(props_, "preview_group_cluster_label");
+		if (lbl) {
+			const bool on = obs_data_get_bool(settings, "preview_group_clusters");
+			obs_property_set_visible(lbl, enabled && is_group && on);
+		}
+
 		return true;
 	});
 
@@ -247,6 +348,33 @@ obs_properties_t *detect_filter_properties(void *data)
 	obs_properties_add_float_slider(tracking_group_props, "zoom_speed_factor",
 					obs_module_text("ZoomSpeed"), 0.0, 0.1, 0.01);
 
+	// Group pan preset: manual end-stops left/center/right (or auto follow)
+	obs_property_t *x_pan_preset = obs_properties_add_list(tracking_group_props, "x_pan_preset",
+							 obs_module_text("XPosition"),
+							 OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(x_pan_preset, obs_module_text("Auto"), "auto");
+	obs_property_list_add_string(x_pan_preset, obs_module_text("Left"), "left");
+	obs_property_list_add_string(x_pan_preset, obs_module_text("Center"), "center");
+	obs_property_list_add_string(x_pan_preset, obs_module_text("Right"), "right");
+	obs_property_list_add_string(x_pan_preset, obs_module_text("Auto Snap"), "autosnap");
+	obs_property_list_add_string(x_pan_preset, obs_module_text("Auto Snap (Smooth)"), "autosnap_smooth");
+
+	obs_properties_add_float_slider(tracking_group_props, "x_snap_hysteresis",
+					 obs_module_text("Snap Hysteresis"), 0.0, 0.20, 0.01);
+
+	obs_properties_add_float_slider(tracking_group_props, "x_snap_transition_time",
+					 obs_module_text("Snap Transition (s)"), 0.05, 1.00, 0.05);
+	
+	obs_properties_add_int_slider(tracking_group_props, "infer_interval_ms",
+			      obs_module_text("Infer Interval (ms)"), 0, 200, 5);
+
+	obs_properties_add_float_slider(tracking_group_props, "infer_scale",
+				obs_module_text("Infer Scale"), 0.25, 1.00, 0.05);
+
+	
+	obs_properties_add_float_slider(tracking_group_props, "x_deadband",
+				obs_module_text("X Deadband (%)"), 0.0, 5.0, 0.1);
+
 	// add object selection for zoom drop down: "Single", "All"
 	obs_property_t *zoom_object = obs_properties_add_list(tracking_group_props, "zoom_object",
 							      obs_module_text("ZoomObject"),
@@ -256,6 +384,46 @@ obs_properties_t *detect_filter_properties(void *data)
 	obs_property_list_add_string(zoom_object, obs_module_text("Biggest"), "biggest");
 	obs_property_list_add_string(zoom_object, obs_module_text("Oldest"), "oldest");
 	obs_property_list_add_string(zoom_object, obs_module_text("All"), "all");
+	//mod x basket
+	obs_property_list_add_string(zoom_object, obs_module_text("Group"), "group");
+obs_property_set_modified_callback(zoom_object, [](obs_properties_t *props_, obs_property_t *, obs_data_t *settings) {
+		// When switching ZoomObject, show cluster preview controls only for "group"
+		const bool enabled = obs_data_get_bool(settings, "tracking_group");
+		const char *zo = obs_data_get_string(settings, "zoom_object");
+		const bool is_group = (zo && strcmp(zo, "group") == 0);
+
+		obs_property_t *pgc = obs_properties_get(props_, "preview_group_clusters");
+		if (pgc)
+			obs_property_set_visible(pgc, enabled && is_group);
+
+		obs_property_t *lbl = obs_properties_get(props_, "preview_group_cluster_label");
+		if (lbl) {
+			const bool on = obs_data_get_bool(settings, "preview_group_clusters");
+			obs_property_set_visible(lbl, enabled && is_group && on);
+		}
+		return true;
+	});
+
+	obs_properties_add_int(tracking_group_props, "group_min_people", "Group min people", 1, 15, 1);
+	obs_properties_add_bool(tracking_group_props, "group_min_people_strict", "Strict min people");
+	obs_property_t *preview_group_clusters =
+		obs_properties_add_bool(tracking_group_props, "preview_group_clusters", "Preview group cluster");
+	obs_property_t *preview_group_cluster_label =
+		obs_properties_add_bool(tracking_group_props, "preview_group_cluster_label", "Show group cluster label");
+	// Initial visibility: detect_filter_properties() has no access to current settings -> start hidden.
+	obs_property_set_visible(preview_group_clusters, false);
+	obs_property_set_visible(preview_group_cluster_label, false);
+	// Show label option only when cluster preview is enabled
+	obs_property_set_modified_callback(preview_group_clusters, [](obs_properties_t *props_, obs_property_t *, obs_data_t *settings) {
+		const bool enabled = obs_data_get_bool(settings, "tracking_group");
+		const bool on = obs_data_get_bool(settings, "preview_group_clusters");
+		const char *zo = obs_data_get_string(settings, "zoom_object");
+		const bool is_group = (zo && strcmp(zo, "group") == 0);
+		obs_property_t *lbl = obs_properties_get(props_, "preview_group_cluster_label");
+		if (lbl)
+			obs_property_set_visible(lbl, enabled && is_group && on);
+		return true;
+	});
 
 	obs_property_t *advanced =
 		obs_properties_add_bool(props, "advanced", obs_module_text("Advanced"));
@@ -325,6 +493,9 @@ obs_properties_t *detect_filter_properties(void *data)
 					OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 
 	obs_property_list_add_string(p_use_gpu, obs_module_text("CPU"), USEGPU_CPU);
+	// OpenVINO
+	obs_property_list_add_string(p_use_gpu, obs_module_text("OpenVINOCPU"), USEGPU_OV_CPU);
+	obs_property_list_add_string(p_use_gpu, obs_module_text("OpenVINOGPU"), USEGPU_OV_GPU);
 #if defined(__linux__) && defined(__x86_64__)
 	obs_property_list_add_string(p_use_gpu, obs_module_text("GPUTensorRT"), USEGPU_TENSORRT);
 	obs_property_list_add_string(p_use_gpu, obs_module_text("GPUCuda"), USEGPU_CUDA);
@@ -446,6 +617,16 @@ void detect_filter_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, "zoom_factor", 0.0);
 	obs_data_set_default_double(settings, "zoom_speed_factor", 0.05);
 	obs_data_set_default_string(settings, "zoom_object", "single");
+	obs_data_set_default_string(settings, "x_pan_preset", "auto");
+	obs_data_set_default_int(settings, "infer_interval_ms", 0);
+	obs_data_set_default_double(settings, "infer_scale", 1.0);
+	obs_data_set_default_int(settings, "group_min_people", 6);
+	obs_data_set_default_bool(settings, "group_min_people_strict", false);
+	obs_data_set_default_bool(settings, "preview_group_clusters", false);
+	obs_data_set_default_bool(settings, "preview_group_cluster_label", false);
+	obs_data_set_default_double(settings, "x_snap_hysteresis", 0.05);
+	obs_data_set_default_double(settings, "x_snap_transition_time", 0.25);
+	obs_data_set_default_double(settings, "x_deadband", 0.0);
 	obs_data_set_default_string(settings, "save_detections_path", "");
 	obs_data_set_default_bool(settings, "crop_group", false);
 	obs_data_set_default_int(settings, "crop_left", 0);
@@ -470,10 +651,43 @@ void detect_filter_update(void *data, obs_data_t *settings)
 	tf->maskingColor = (int)obs_data_get_int(settings, "masking_color");
 	tf->maskingBlurRadius = (int)obs_data_get_int(settings, "masking_blur_radius");
 	tf->maskingDilateIterations = (int)obs_data_get_int(settings, "dilation_iterations");
+
 	bool newTrackingEnabled = obs_data_get_bool(settings, "tracking_group");
 	tf->zoomFactor = (float)obs_data_get_double(settings, "zoom_factor");
 	tf->zoomSpeedFactor = (float)obs_data_get_double(settings, "zoom_speed_factor");
 	tf->zoomObject = obs_data_get_string(settings, "zoom_object");
+
+	tf->groupMinPeople = (int)obs_data_get_int(settings, "group_min_people");
+	tf->groupMinPeople = std::max(1, tf->groupMinPeople);
+	tf->groupMinPeopleStrict = obs_data_get_bool(settings, "group_min_people_strict");
+	tf->previewGroupClusters = obs_data_get_bool(settings, "preview_group_clusters");
+	tf->previewGroupClusterLabel = obs_data_get_bool(settings, "preview_group_cluster_label");
+
+	tf->x_pan_preset = obs_data_get_string(settings, "x_pan_preset");
+	tf->x_snap_hysteresis = (float)obs_data_get_double(settings, "x_snap_hysteresis");
+	tf->x_snap_transition_time = (float)obs_data_get_double(settings, "x_snap_transition_time");
+	tf->infer_interval_ms = (int)obs_data_get_int(settings, "infer_interval_ms");
+	tf->infer_interval_ms = std::clamp(tf->infer_interval_ms, 0, 200);
+
+	tf->infer_scale = (float)obs_data_get_double(settings, "infer_scale");
+	tf->infer_scale = std::clamp(tf->infer_scale, 0.25f, 1.0f);
+
+	// reset cache on settings change
+	tf->cached_objects_valid = false;
+	tf->last_infer_ts_ns = 0;
+
+	tf->x_deadband = (float)obs_data_get_double(settings, "x_deadband");
+	tf->x_deadband = std::clamp(tf->x_deadband, 0.0f, 5.0f);
+	tf->has_last_target_zx = false; // reset safe when settings change
+
+
+	if (tf->x_pan_preset == "left")
+		tf->x_snap_state = 0;
+	else if (tf->x_pan_preset == "center")
+		tf->x_snap_state = 1;
+	else if (tf->x_pan_preset == "right")
+		tf->x_snap_state = 2;
+
 	tf->sortTracking = obs_data_get_bool(settings, "sort_tracking");
 	size_t maxUnseenFrames = (size_t)obs_data_get_int(settings, "max_unseen_frames");
 	if (tf->tracker.getMaxUnseenFrames() != maxUnseenFrames) {
@@ -481,11 +695,13 @@ void detect_filter_update(void *data, obs_data_t *settings)
 	}
 	tf->showUnseenObjects = obs_data_get_bool(settings, "show_unseen_objects");
 	tf->saveDetectionsPath = obs_data_get_string(settings, "save_detections_path");
+
 	tf->crop_enabled = obs_data_get_bool(settings, "crop_group");
 	tf->crop_left = (int)obs_data_get_int(settings, "crop_left");
 	tf->crop_right = (int)obs_data_get_int(settings, "crop_right");
 	tf->crop_top = (int)obs_data_get_int(settings, "crop_top");
 	tf->crop_bottom = (int)obs_data_get_int(settings, "crop_bottom");
+
 	tf->minAreaThreshold = (int)obs_data_get_int(settings, "min_size_threshold");
 
 	// check if tracking state has changed
@@ -498,22 +714,16 @@ void detect_filter_update(void *data, obs_data_t *settings)
 		}
 		if (tf->trackingEnabled) {
 			obs_log(LOG_DEBUG, "Tracking enabled");
-			// get the parent of the source
-			// check if it has a crop/pad filter
 			obs_source_t *crop_pad_filter =
 				obs_source_get_filter_by_name(parent, "Detect Tracking");
 			if (!crop_pad_filter) {
-				// create a crop-pad filter
 				crop_pad_filter = obs_source_create(
 					"crop_filter", "Detect Tracking", nullptr, nullptr);
-				// add a crop/pad filter to the source
-				// set the parent of the crop/pad filter to the parent of the source
 				obs_source_filter_add(parent, crop_pad_filter);
 			}
 			tf->trackingFilter = crop_pad_filter;
 		} else {
 			obs_log(LOG_DEBUG, "Tracking disabled");
-			// remove the crop/pad filter
 			obs_source_t *crop_pad_filter =
 				obs_source_get_filter_by_name(parent, "Detect Tracking");
 			if (crop_pad_filter) {
@@ -527,13 +737,11 @@ void detect_filter_update(void *data, obs_data_t *settings)
 	const uint32_t newNumThreads = (uint32_t)obs_data_get_int(settings, "numThreads");
 	const std::string newModelSize = obs_data_get_string(settings, "model_size");
 
-	bool reinitialize = false;
-	if (tf->useGPU != newUseGpu || tf->numThreads != newNumThreads ||
-	    tf->modelSize != newModelSize) {
-		obs_log(LOG_INFO, "Reinitializing model");
-		reinitialize = true;
+	bool reinitialize = (tf->useGPU != newUseGpu || tf->numThreads != newNumThreads || tf->modelSize != newModelSize);
 
-		// lock modelMutex
+	if (reinitialize) {
+		obs_log(LOG_INFO, "Reinitializing model");
+
 		std::unique_lock<std::mutex> lock(tf->modelMutex);
 
 		char *modelFilepath_rawPtr = nullptr;
@@ -552,8 +760,7 @@ void detect_filter_update(void *data, obs_data_t *settings)
 		} else if (newModelSize == EXTERNAL_MODEL_SIZE) {
 			const char *external_model_file =
 				obs_data_get_string(settings, "external_model_file");
-			if (external_model_file == nullptr || external_model_file[0] == '\0' ||
-			    strlen(external_model_file) == 0) {
+			if (!external_model_file || external_model_file[0] == '\0') {
 				obs_log(LOG_ERROR, "External model file path is empty");
 				tf->isDisabled = true;
 				return;
@@ -565,7 +772,7 @@ void detect_filter_update(void *data, obs_data_t *settings)
 			return;
 		}
 
-		if (modelFilepath_rawPtr == nullptr) {
+		if (!modelFilepath_rawPtr) {
 			obs_log(LOG_ERROR, "Unable to get model filename from plugin.");
 			tf->isDisabled = true;
 			return;
@@ -573,7 +780,7 @@ void detect_filter_update(void *data, obs_data_t *settings)
 
 #if _WIN32
 		int outLength = MultiByteToWideChar(CP_ACP, MB_PRECOMPOSED, modelFilepath_rawPtr,
-						    -1, nullptr, 0);
+					    -1, nullptr, 0);
 		tf->modelFilepath = std::wstring(outLength, L'\0');
 		MultiByteToWideChar(CP_ACP, MB_PRECOMPOSED, modelFilepath_rawPtr, -1,
 				    tf->modelFilepath.data(), outLength);
@@ -582,19 +789,15 @@ void detect_filter_update(void *data, obs_data_t *settings)
 #endif
 		bfree(modelFilepath_rawPtr);
 
-		// Re-initialize model if it's not already the selected one or switching inference device
 		tf->useGPU = newUseGpu;
 		tf->numThreads = newNumThreads;
 		tf->modelSize = newModelSize;
 
-		// parameters
-		int onnxruntime_device_id_ = 0;
-		bool onnxruntime_use_parallel_ = true;
 		float nms_th_ = 0.45f;
 		int num_classes_ = (int)edgeyolo_cpp::COCO_CLASSES.size();
 		tf->classNames = edgeyolo_cpp::COCO_CLASSES;
 
-		// If this is an external model - look for the config JSON file
+		// External model labels
 		if (tf->modelSize == EXTERNAL_MODEL_SIZE) {
 #ifdef _WIN32
 			std::wstring labelsFilepath = tf->modelFilepath;
@@ -604,94 +807,69 @@ void detect_filter_update(void *data, obs_data_t *settings)
 			labelsFilepath.replace(labelsFilepath.find(".onnx"), 5, ".json");
 #endif
 			std::ifstream labelsFile(labelsFilepath);
-			if (labelsFile.is_open()) {
-				// Parse the JSON file
-				nlohmann::json j;
-				labelsFile >> j;
-				if (j.contains("names")) {
-					std::vector<std::string> labels = j["names"];
-					num_classes_ = (int)labels.size();
-					tf->classNames = labels;
-				} else {
-					obs_log(LOG_ERROR,
-						"JSON file does not contain 'labels' field");
-					tf->isDisabled = true;
-					tf->onnxruntimemodel.reset();
-					return;
-				}
-			} else {
-				obs_log(LOG_ERROR, "Failed to open JSON file: %s",
-					labelsFilepath.c_str());
+			if (!labelsFile.is_open()) {
+				obs_log(LOG_ERROR, "Failed to open JSON file for external model labels");
 				tf->isDisabled = true;
-				tf->onnxruntimemodel.reset();
+				tf->model.reset();
 				return;
 			}
+			nlohmann::json j;
+			labelsFile >> j;
+			if (!j.contains("names")) {
+				obs_log(LOG_ERROR, "JSON file does not contain 'names' field");
+				tf->isDisabled = true;
+				tf->model.reset();
+				return;
+			}
+			std::vector<std::string> labels = j["names"];
+			num_classes_ = (int)labels.size();
+			tf->classNames = labels;
 		} else if (tf->modelSize == FACE_DETECT_MODEL_SIZE) {
 			num_classes_ = 1;
 			tf->classNames = yunet::FACE_CLASSES;
 		}
 
-		// Load model
 		try {
-			if (tf->onnxruntimemodel) {
-				tf->onnxruntimemodel.reset();
-			}
+#ifdef _WIN32
+			std::string modelPathString = wide_to_utf8(tf->modelFilepath);
+#else
+			std::string modelPathString = tf->modelFilepath;
+#endif
+			const std::string device =
+				(tf->useGPU == USEGPU_OV_GPU) ? "GPU" : "CPU";
+
+			tf->model.reset();
+
 			if (tf->modelSize == FACE_DETECT_MODEL_SIZE) {
-				tf->onnxruntimemodel = std::make_unique<yunet::YuNetONNX>(
-					tf->modelFilepath, tf->numThreads, 50, tf->numThreads,
-					tf->useGPU, onnxruntime_device_id_,
-					onnxruntime_use_parallel_, nms_th_, tf->conf_threshold);
+				tf->model = std::make_unique<YuNetOpenVINOAdapter>(
+					modelPathString, device, (int)tf->numThreads,
+					50, nms_th_, tf->conf_threshold);
 			} else {
-				tf->onnxruntimemodel =
-					std::make_unique<edgeyolo_cpp::EdgeYOLOONNXRuntime>(
-						tf->modelFilepath, tf->numThreads, num_classes_,
-						tf->numThreads, tf->useGPU, onnxruntime_device_id_,
-						onnxruntime_use_parallel_, nms_th_,
-						tf->conf_threshold);
+				tf->model = std::make_unique<EdgeYOLOOpenVINOAdapter>(
+					modelPathString, device, (int)tf->numThreads,
+					num_classes_, nms_th_, tf->conf_threshold);
 			}
-			// clear error message
 			obs_data_set_string(settings, "error", "");
 		} catch (const std::exception &e) {
-			obs_log(LOG_ERROR, "Failed to load model: %s", e.what());
-			// disable filter
+			obs_log(LOG_ERROR, "Failed to load OpenVINO model: %s", e.what());
 			tf->isDisabled = true;
-			tf->onnxruntimemodel.reset();
+			tf->model.reset();
 			return;
 		}
 	}
 
-	// update threshold on edgeyolo
-	if (tf->onnxruntimemodel) {
-		tf->onnxruntimemodel->setBBoxConfThresh(tf->conf_threshold);
+	if (tf->model) {
+		tf->model->setBBoxConfThresh(tf->conf_threshold);
 	}
 
 	if (reinitialize) {
-		// Log the currently selected options
 		obs_log(LOG_INFO, "Detect Filter Options:");
-		// name of the source that the filter is attached to
 		obs_log(LOG_INFO, "  Source: %s", obs_source_get_name(tf->source));
 		obs_log(LOG_INFO, "  Inference Device: %s", tf->useGPU.c_str());
 		obs_log(LOG_INFO, "  Num Threads: %d", tf->numThreads);
 		obs_log(LOG_INFO, "  Model Size: %s", tf->modelSize.c_str());
 		obs_log(LOG_INFO, "  Preview: %s", tf->preview ? "true" : "false");
 		obs_log(LOG_INFO, "  Threshold: %.2f", tf->conf_threshold);
-		obs_log(LOG_INFO, "  Object Category: %s",
-			obs_data_get_string(settings, "object_category"));
-		obs_log(LOG_INFO, "  Masking Enabled: %s",
-			obs_data_get_bool(settings, "masking_group") ? "true" : "false");
-		obs_log(LOG_INFO, "  Masking Type: %s",
-			obs_data_get_string(settings, "masking_type"));
-		obs_log(LOG_INFO, "  Masking Color: %s",
-			obs_data_get_string(settings, "masking_color"));
-		obs_log(LOG_INFO, "  Masking Blur Radius: %d",
-			obs_data_get_int(settings, "masking_blur_radius"));
-		obs_log(LOG_INFO, "  Tracking Enabled: %s",
-			obs_data_get_bool(settings, "tracking_group") ? "true" : "false");
-		obs_log(LOG_INFO, "  Zoom Factor: %.2f",
-			obs_data_get_double(settings, "zoom_factor"));
-		obs_log(LOG_INFO, "  Zoom Object: %s",
-			obs_data_get_string(settings, "zoom_object"));
-		obs_log(LOG_INFO, "  Disabled: %s", tf->isDisabled ? "true" : "false");
 #ifdef _WIN32
 		obs_log(LOG_INFO, "  Model file path: %ls", tf->modelFilepath.c_str());
 #else
@@ -699,7 +877,6 @@ void detect_filter_update(void *data, obs_data_t *settings)
 #endif
 	}
 
-	// enable
 	tf->isDisabled = false;
 }
 
@@ -774,9 +951,242 @@ void detect_filter_destroy(void *data)
 		}
 		gs_effect_destroy(tf->kawaseBlurEffect);
 		gs_effect_destroy(tf->maskingEffect);
-		obs_leave_graphics();
+
+		gs_effect_destroy(tf->pixelateEffect);
+obs_leave_graphics();
 		tf->~detect_filter();
 		bfree(tf);
+	}
+}
+
+//MOD x basket
+static bool areClose(const cv::Rect2f &a, const cv::Rect2f &b, float maxDist)
+{
+    cv::Point2f ca(a.x + a.width * 0.5f, a.y + a.height * 0.5f);
+    cv::Point2f cb(b.x + b.width * 0.5f, b.y + b.height * 0.5f);
+    return cv::norm(ca - cb) < maxDist;
+}
+
+static bool buildGroupBBox(const std::vector<Object> &objects,
+                           cv::Rect2f &outBox,
+                           int minPeople,
+                           float maxDist)
+{
+    for (size_t i = 0; i < objects.size(); ++i) {
+        if (objects[i].unseenFrames > 0)
+            continue;
+
+        cv::Rect2f groupBox = objects[i].rect;
+        int count = 1;
+
+        for (size_t j = 0; j < objects.size(); ++j) {
+            if (i == j || objects[j].unseenFrames > 0)
+                continue;
+
+            if (areClose(objects[i].rect, objects[j].rect, maxDist)) {
+                groupBox |= objects[j].rect;
+                count++;
+            }
+        }
+
+        if (count >= minPeople) {
+            outBox = groupBox;
+            return true;
+        }
+    }
+    return false;
+}
+
+// --- Group clustering helpers (multiple clusters) ---
+// Builds connected components using the same "areClose" criterion (transitive closure).
+struct GroupCluster
+{
+	cv::Rect2f box;
+	int count = 0;
+};
+
+// Full clustering (used for preview): returns all clusters (count>=minPeople), sorted by area desc.
+static std::vector<GroupCluster> buildGroupClusters(const std::vector<Object> &objects,
+							    int minPeople,
+							    float maxDist)
+{
+	std::vector<size_t> visibleIdx;
+	visibleIdx.reserve(objects.size());
+	for (size_t i = 0; i < objects.size(); ++i) {
+		if (objects[i].unseenFrames == 0)
+			visibleIdx.push_back(i);
+	}
+
+	std::vector<GroupCluster> clusters;
+	if (visibleIdx.empty())
+		return clusters;
+
+	// Reuse buffer to avoid per-frame allocations (CPU spikes)
+	static std::vector<uint8_t> visited;
+	visited.assign(objects.size(), 0);
+
+	std::vector<size_t> stack;
+	stack.reserve(visibleIdx.size());
+
+	for (size_t seedPos = 0; seedPos < visibleIdx.size(); ++seedPos) {
+		size_t seed = visibleIdx[seedPos];
+		if (visited[seed])
+			continue;
+
+		// BFS/DFS over "close" graph (transitive)
+		stack.clear();
+		stack.push_back(seed);
+		visited[seed] = 1;
+
+		cv::Rect2f box = objects[seed].rect;
+		int count = 0;
+
+		while (!stack.empty()) {
+			size_t u = stack.back();
+			stack.pop_back();
+			++count;
+			box |= objects[u].rect;
+
+			// Compare only against not-yet-visited visible nodes.
+			for (size_t vPos = 0; vPos < visibleIdx.size(); ++vPos) {
+				size_t v = visibleIdx[vPos];
+				if (visited[v])
+					continue;
+				if (areClose(objects[u].rect, objects[v].rect, maxDist)) {
+					visited[v] = 1;
+					stack.push_back(v);
+				}
+			}
+		}
+
+		if (count >= std::max(1, minPeople)) {
+			GroupCluster c;
+			c.box = box;
+			c.count = count;
+			clusters.push_back(c);
+		}
+	}
+
+	// Prefer biggest cluster first (useful for selecting boundingBox)
+	std::sort(clusters.begin(), clusters.end(), [](const GroupCluster &a, const GroupCluster &b) {
+		const float aa = a.box.area();
+		const float bb = b.box.area();
+		if (aa != bb)
+			return aa > bb;
+		return a.count > b.count;
+	});
+
+	return clusters;
+}
+
+// Best-cluster selection (used for crop/tracking):
+// - avoids storing/sorting all clusters
+// - early-exit when a cluster contains *all* visible people (cannot be beaten by count)
+static bool selectBestGroupCluster(const std::vector<Object> &objects,
+					  int minPeople,
+					  float maxDist,
+					  GroupCluster &bestOut)
+{
+	std::vector<size_t> visibleIdx;
+	visibleIdx.reserve(objects.size());
+	for (size_t i = 0; i < objects.size(); ++i) {
+		if (objects[i].unseenFrames == 0)
+			visibleIdx.push_back(i);
+	}
+	if (visibleIdx.empty())
+		return false;
+
+	static std::vector<uint8_t> visited;
+	visited.assign(objects.size(), 0);
+
+	std::vector<size_t> stack;
+	stack.reserve(visibleIdx.size());
+
+	bool found = false;
+	float bestArea = -1.0f;
+
+	for (size_t seedPos = 0; seedPos < visibleIdx.size(); ++seedPos) {
+		const size_t seed = visibleIdx[seedPos];
+		if (visited[seed])
+			continue;
+
+		stack.clear();
+		stack.push_back(seed);
+		visited[seed] = 1;
+
+		cv::Rect2f box = objects[seed].rect;
+		int count = 0;
+
+		while (!stack.empty()) {
+			size_t u = stack.back();
+			stack.pop_back();
+			++count;
+			box |= objects[u].rect;
+
+			for (size_t vPos = 0; vPos < visibleIdx.size(); ++vPos) {
+				size_t v = visibleIdx[vPos];
+				if (visited[v])
+					continue;
+				if (areClose(objects[u].rect, objects[v].rect, maxDist)) {
+					visited[v] = 1;
+					stack.push_back(v);
+				}
+			}
+		}
+
+		if (count >= std::max(1, minPeople)) {
+			const float area = box.area();
+			if (!found || area > bestArea || (area == bestArea && count > bestOut.count)) {
+				bestOut.box = box;
+				bestOut.count = count;
+				bestArea = area;
+				found = true;
+			}
+			// EARLY-EXIT (crop): if this cluster contains everyone visible, it's maximal by count.
+			if (count == (int)visibleIdx.size()) {
+				return true;
+			}
+		}
+	}
+
+	return found;
+}
+
+static void drawGroupClusters(cv::Mat &frame,
+			      const std::vector<Object> &objects,
+			      int minPeople,
+			      float maxDist,
+			      bool showLabel)
+{
+	auto clusters = buildGroupClusters(objects, minPeople, maxDist);
+	if (clusters.empty())
+		return;
+
+	// Style: thicker stroke for clusters
+	const int thickness = 3;
+	for (size_t i = 0; i < clusters.size(); ++i) {
+		const auto &c = clusters[i];
+		cv::Rect r = c.box;
+		// Clamp to image bounds (avoid OpenCV assertions)
+		r &= cv::Rect(0, 0, frame.cols, frame.rows);
+		if (r.width <= 0 || r.height <= 0)
+			continue;
+
+		cv::rectangle(frame, r, cv::Scalar(255, 0, 255), thickness);
+
+		if (!showLabel)
+			continue;
+
+		// Label: "G1 (N)" — build string only when enabled
+		const std::string label = "G" + std::to_string(i + 1) + " (" + std::to_string(c.count) + ")";
+		int baseline = 0;
+		auto ts = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.7, 2, &baseline);
+		const int x = std::max(0, r.x);
+		const int y = std::max(ts.height + 4, r.y);
+		cv::rectangle(frame, cv::Rect(x, y - ts.height - 4, ts.width + 6, ts.height + 6),
+			      cv::Scalar(0, 0, 0), -1);
+		cv::putText(frame, label, cv::Point(x + 3, y),
+			    cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 2);
 	}
 }
 
@@ -786,7 +1196,7 @@ void detect_filter_video_tick(void *data, float seconds)
 
 	struct detect_filter *tf = reinterpret_cast<detect_filter *>(data);
 
-	if (tf->isDisabled || !tf->onnxruntimemodel) {
+	if (tf->isDisabled || !tf->model) {
 		return;
 	}
 
@@ -822,16 +1232,52 @@ void detect_filter_video_tick(void *data, float seconds)
 
 	std::vector<Object> objects;
 
+// ---- CPU OPT: throttle inference (reuse cached objects) ----
+const uint64_t nowInferNs = os_gettime_ns();
+const uint64_t inferIntervalNs =
+	(tf->infer_interval_ms > 0) ? (uint64_t)tf->infer_interval_ms * 1000000ULL : 0ULL;
+
+const bool skipInfer = (inferIntervalNs > 0ULL) &&
+		tf->cached_objects_valid &&
+		(nowInferNs - tf->last_infer_ts_ns) < inferIntervalNs;
+
+if (skipInfer) {
+	objects = tf->cached_objects;
+} else {
+	// ---- CPU OPT: downscale only for inference ----
+	static cv::Mat inferScaled;
+	cv::Mat &inferInput = inferenceFrame;
+
+	if (tf->infer_scale < 0.999f) {
+		const double s = (double)tf->infer_scale;
+		cv::resize(inferenceFrame, inferScaled, cv::Size(), s, s, cv::INTER_LINEAR);
+		inferInput = inferScaled;
+	}
+
 	try {
 		std::unique_lock<std::mutex> lock(tf->modelMutex);
-		objects = tf->onnxruntimemodel->inference(inferenceFrame);
-	} catch (const Ort::Exception &e) {
-		obs_log(LOG_ERROR, "ONNXRuntime Exception: %s", e.what());
+		objects = tf->model->inference(inferInput);
 	} catch (const std::exception &e) {
 		obs_log(LOG_ERROR, "%s", e.what());
 	}
 
-	if (tf->crop_enabled) {
+	// If inference ran on a scaled frame, rescale detections back to inferenceFrame coordinates
+	if (tf->infer_scale < 0.999f && tf->infer_scale > 0.0f) {
+		const float inv = 1.0f / tf->infer_scale;
+		for (Object &obj : objects) {
+			obj.rect.x *= inv;
+			obj.rect.y *= inv;
+			obj.rect.width *= inv;
+			obj.rect.height *= inv;
+		}
+	}
+
+	// cache results
+	tf->cached_objects = objects;
+	tf->cached_objects_valid = true;
+	tf->last_infer_ts_ns = nowInferNs;
+}
+if (tf->crop_enabled) {
 		// translate the detected objects to the original frame
 		for (Object &obj : objects) {
 			obj.rect.x += (float)cropRect.x;
@@ -862,26 +1308,22 @@ void detect_filter_video_tick(void *data, float seconds)
 	}
 
 	if (tf->minAreaThreshold > 0) {
-		std::vector<Object> filtered_objects;
-		for (const Object &obj : objects) {
-			if (obj.rect.area() > (float)tf->minAreaThreshold) {
-				filtered_objects.push_back(obj);
-			}
-		}
-		objects = filtered_objects;
+		objects.erase(
+			std::remove_if(objects.begin(), objects.end(), [tf](const Object &obj) {
+				return obj.rect.area() <= (float)tf->minAreaThreshold;
+			}),
+			objects.end());
 	}
 
-	if (tf->objectCategory != -1) {
-		std::vector<Object> filtered_objects;
-		for (const Object &obj : objects) {
-			if (obj.label == tf->objectCategory) {
-				filtered_objects.push_back(obj);
-			}
-		}
-		objects = filtered_objects;
+if (tf->objectCategory != -1) {
+		objects.erase(
+			std::remove_if(objects.begin(), objects.end(), [tf](const Object &obj) {
+				return obj.label != tf->objectCategory;
+			}),
+			objects.end());
 	}
 
-	if (tf->sortTracking) {
+if (tf->sortTracking) {
 		objects = tf->tracker.update(objects);
 	}
 
@@ -893,25 +1335,30 @@ void detect_filter_video_tick(void *data, float seconds)
 	}
 
 	if (!tf->saveDetectionsPath.empty()) {
-		std::ofstream detectionsFile(tf->saveDetectionsPath);
-		if (detectionsFile.is_open()) {
-			nlohmann::json j;
-			for (const Object &obj : objects) {
-				nlohmann::json obj_json;
-				obj_json["label"] = obj.label;
-				obj_json["confidence"] = obj.prob;
-				obj_json["rect"] = {{"x", obj.rect.x},
-						    {"y", obj.rect.y},
-						    {"width", obj.rect.width},
-						    {"height", obj.rect.height}};
-				obj_json["id"] = obj.id;
-				j.push_back(obj_json);
+		// Throttle disk writes a bit to reduce per-frame overhead
+		static uint64_t saveCounter = 0;
+		if ((++saveCounter % 5) == 0) {
+			std::ofstream detectionsFile(tf->saveDetectionsPath);
+			if (detectionsFile.is_open()) {
+				nlohmann::json j;
+				for (const Object &obj : objects) {
+					nlohmann::json obj_json;
+					obj_json["label"] = obj.label;
+					obj_json["confidence"] = obj.prob;
+					obj_json["rect"] = {{"x", obj.rect.x},
+							  {"y", obj.rect.y},
+							  {"width", obj.rect.width},
+							  {"height", obj.rect.height}};
+					obj_json["id"] = obj.id;
+					j.push_back(obj_json);
+				}
+				// Compact JSON (no indentation) to reduce CPU + IO
+				detectionsFile << j.dump();
+				detectionsFile.close();
+			} else {
+				obs_log(LOG_ERROR, "Failed to open file for writing detections: %s",
+					tf->saveDetectionsPath.c_str());
 			}
-			detectionsFile << j.dump(4);
-			detectionsFile.close();
-		} else {
-			obs_log(LOG_ERROR, "Failed to open file for writing detections: %s",
-				tf->saveDetectionsPath.c_str());
 		}
 	}
 
@@ -926,23 +1373,39 @@ void detect_filter_video_tick(void *data, float seconds)
 		if (tf->preview && objects.size() > 0) {
 			draw_objects(frame, objects, tf->classNames);
 		}
-		if (tf->maskingEnabled) {
-			cv::Mat mask = cv::Mat::zeros(frame.size(), CV_8UC1);
+		// Optional debug overlay: draw one bbox per detected people-cluster (group).
+		// This is useful when zoomObject == "group" to understand which cluster is being selected.
+		if (tf->preview && tf->zoomObject == "group" && !objects.empty()) {
+			int visibleCount = 0;
 			for (const Object &obj : objects) {
-				cv::rectangle(mask, obj.rect, cv::Scalar(255), -1);
+				if (obj.unseenFrames == 0)
+					visibleCount++;
 			}
-			std::lock_guard<std::mutex> lock(tf->outputLock);
-			mask.copyTo(tf->outputMask);
+			int minPeople = std::max(1, tf->groupMinPeople);
+			if (!tf->groupMinPeopleStrict && visibleCount > 0)
+				minPeople = std::min(minPeople, visibleCount);
+			const float maxDist = static_cast<float>(frame.cols) * 0.15f;
+			if (tf->previewGroupClusters)
+				drawGroupClusters(frame, objects, minPeople, maxDist, tf->previewGroupClusterLabel);
+		}
 
+
+		cv::Mat finalMask;
+		if (tf->maskingEnabled) {
+			finalMask = cv::Mat::zeros(frame.size(), CV_8UC1);
+			for (const Object &obj : objects) {
+				cv::rectangle(finalMask, obj.rect, cv::Scalar(255), -1);
+			}
 			if (tf->maskingDilateIterations > 0) {
-				cv::Mat dilatedMask;
-				cv::dilate(tf->outputMask, dilatedMask, cv::Mat(),
-					   cv::Point(-1, -1), tf->maskingDilateIterations);
-				dilatedMask.copyTo(tf->outputMask);
+				cv::dilate(finalMask, finalMask, cv::Mat(), cv::Point(-1, -1),
+					   tf->maskingDilateIterations);
 			}
 		}
 
 		std::lock_guard<std::mutex> lock(tf->outputLock);
+		if (tf->maskingEnabled) {
+			finalMask.copyTo(tf->outputMask);
+		}
 		cv::cvtColor(frame, tf->outputPreviewBGRA, cv::COLOR_BGR2BGRA);
 	}
 
@@ -952,99 +1415,315 @@ void detect_filter_video_tick(void *data, float seconds)
 
 		cv::Rect2f boundingBox = cv::Rect2f(0, 0, (float)width, (float)height);
 		// get location of the objects
-		if (tf->zoomObject == "single") {
-			if (objects.size() > 0) {
-				// find first visible object
+		//MOD x Basket
+                if (tf->zoomObject == "single") {
+
+        for (const Object &obj : objects) {
+        if (obj.unseenFrames == 0) {
+            boundingBox = obj.rect;
+            break;
+                }
+                }
+
+                } else if (tf->zoomObject == "group") {
+
+		cv::Rect2f groupBox;
+
+		// Distanza massima tra persone (in px): frazione della larghezza, resta scalabile con la risoluzione
+		const float maxDist = static_cast<float>(width) * 0.15f; // tarabile (basket)
+
+		// Conta solo oggetti "visibili" (unseenFrames == 0)
+		int visibleCount = 0;
+		for (const Object &obj : objects) {
+			if (obj.unseenFrames == 0)
+				visibleCount++;
+		}
+
+		// Minimo persone per considerare un "gruppo".
+		int minPeople = std::max(1, tf->groupMinPeople);
+		if (!tf->groupMinPeopleStrict && visibleCount > 0)
+			minPeople = std::min(minPeople, visibleCount);
+
+		// ---- CPU OPT: throttle group clustering for crop (no need every frame) ----
+		const uint64_t nowNs = os_gettime_ns();
+		const uint64_t throttleNs = 100000000ULL; // 100 ms
+
+		if (tf->lastGroupBoxValid && (nowNs - tf->lastGroupBoxTsNs) < throttleNs) {
+			// Reuse cached bbox for crop
+			boundingBox = tf->lastGroupBox;
+		} else if (visibleCount > 0) {
+
+			GroupCluster best;
+			if (selectBestGroupCluster(objects, minPeople, maxDist, best)) {
+				boundingBox = best.box;
+
+				// cache for next frames
+				tf->lastGroupBox = best.box;
+				tf->lastGroupCount = best.count;
+				tf->lastGroupBoxValid = true;
+				tf->lastGroupBoxTsNs = nowNs;
+			} else {
+				// fallback: unione di tutti gli oggetti visibili (così non resta full-frame)
+				bool first = true;
 				for (const Object &obj : objects) {
-					if (obj.unseenFrames == 0) {
-						boundingBox = obj.rect;
-						break;
+					if (obj.unseenFrames > 0)
+						continue;
+					if (first) {
+						groupBox = obj.rect;
+						first = false;
+					} else {
+						groupBox |= obj.rect;
 					}
 				}
-			}
-		} else if (tf->zoomObject == "biggest") {
-			// get the bounding box of the biggest object
-			if (objects.size() > 0) {
-				float maxArea = 0;
-				for (const Object &obj : objects) {
-					const float area = obj.rect.width * obj.rect.height;
-					if (area > maxArea) {
-						maxArea = area;
-						boundingBox = obj.rect;
-					}
-				}
-			}
-		} else if (tf->zoomObject == "oldest") {
-			// get the object with the oldest id that's visible currently
-			if (objects.size() > 0) {
-				uint64_t oldestId = UINT64_MAX;
-				for (const Object &obj : objects) {
-					if (obj.unseenFrames == 0 && obj.id < oldestId) {
-						oldestId = obj.id;
-						boundingBox = obj.rect;
-					}
+				if (!first) {
+					boundingBox = groupBox;
+
+					// cache fallback too
+					tf->lastGroupBox = groupBox;
+					tf->lastGroupCount = visibleCount;
+					tf->lastGroupBoxValid = true;
+					tf->lastGroupBoxTsNs = nowNs;
+				} else {
+					tf->lastGroupBoxValid = false;
 				}
 			}
 		} else {
-			// get the bounding box of all objects
-			if (objects.size() > 0) {
-				boundingBox = objects[0].rect;
-				for (const Object &obj : objects) {
-					if (obj.unseenFrames > 0) {
-						continue;
-					}
+			tf->lastGroupBoxValid = false;
+		}
+
+	} else if (tf->zoomObject == "biggest") {
+
+		float maxArea = 0;
+		for (const Object &obj : objects) {
+			if (obj.unseenFrames > 0)
+				continue;
+			float area = obj.rect.area();
+			if (area > maxArea) {
+            maxArea = area;
+            boundingBox = obj.rect;
+                }
+        }
+
+                } else if (tf->zoomObject == "oldest") {
+
+        uint64_t oldestId = UINT64_MAX;
+        for (const Object &obj : objects) {
+        if (obj.unseenFrames == 0 && obj.id < oldestId) {
+            oldestId = obj.id;
+            boundingBox = obj.rect;
+                }
+        }
+
+                } else {
+
+		if (!objects.empty()) {
+			bool init = false;
+			for (const Object &obj : objects) {
+				if (obj.unseenFrames > 0)
+					continue;
+				if (!init) {
+					boundingBox = obj.rect;
+					init = true;
+				} else {
 					boundingBox |= obj.rect;
 				}
 			}
+			// If everything is unseen, keep full frame as fallback
 		}
-		bool lostTracking = objects.size() == 0;
-		// the zooming box should maintain the aspect ratio of the image
-		// with the tf->zoomFactor controlling the effective buffer around the bounding box
-		// the bounding box is the center of the zooming box
-		float frameAspectRatio = (float)width / (float)height;
-		// calculate an aspect ratio box around the object using its height
-		float boxHeight = boundingBox.height;
-		// calculate the zooming box size
-		float dh = (float)height - boxHeight;
-		float buffer = dh * (1.0f - tf->zoomFactor);
-		float zh = boxHeight + buffer;
-		float zw = zh * frameAspectRatio;
-		// calculate the top left corner of the zooming box
-		float zx = boundingBox.x - (zw - boundingBox.width) / 2.0f;
-		float zy = boundingBox.y - (zh - boundingBox.height) / 2.0f;
-
-		if (tf->trackingRect.width == 0) {
-			// initialize the trackingRect
-			tf->trackingRect = cv::Rect2f(zx, zy, zw, zh);
-		} else {
-			// interpolate the zooming box to tf->trackingRect
-			float factor = tf->zoomSpeedFactor * (lostTracking ? 0.2f : 1.0f);
-			tf->trackingRect.x =
-				tf->trackingRect.x + factor * (zx - tf->trackingRect.x);
-			tf->trackingRect.y =
-				tf->trackingRect.y + factor * (zy - tf->trackingRect.y);
-			tf->trackingRect.width =
-				tf->trackingRect.width + factor * (zw - tf->trackingRect.width);
-			tf->trackingRect.height =
-				tf->trackingRect.height + factor * (zh - tf->trackingRect.height);
 		}
 
-		// get the settings of the crop/pad filter
-		obs_data_t *crop_pad_settings = obs_source_get_settings(tf->trackingFilter);
-		obs_data_set_int(crop_pad_settings, "left", (int)tf->trackingRect.x);
-		obs_data_set_int(crop_pad_settings, "top", (int)tf->trackingRect.y);
-		// right = image width - (zx + zw)
-		obs_data_set_int(
-			crop_pad_settings, "right",
-			(int)((float)width - (tf->trackingRect.x + tf->trackingRect.width)));
-		// bottom = image height - (zy + zh)
-		obs_data_set_int(
-			crop_pad_settings, "bottom",
-			(int)((float)height - (tf->trackingRect.y + tf->trackingRect.height)));
-		// apply the settings
-		obs_source_update(tf->trackingFilter, crop_pad_settings);
-		obs_data_release(crop_pad_settings);
+		bool lostTracking = true;
+		for (const Object &obj : objects) {
+			if (obj.unseenFrames == 0) {
+				lostTracking = false;
+				break;
+			}
+		}
+                // the zooming box should maintain the aspect ratio of the image
+                // with the tf->zoomFactor controlling the effective buffer around the bounding box
+                // the bounding box is the center of the zooming box
+
+// Maintain the aspect ratio of the image.
+// Default behaviour: dynamic zoom box (old behaviour).
+// For "group": horizontal pan only (no zoom), full height, fixed window width.
+float frameAspectRatio = (float)width / (float)height;
+
+float zx = 0.0f, zy = 0.0f, zw = 0.0f, zh = 0.0f;
+
+if (tf->zoomObject == "group") {
+        // Pan-only on X: keep full height (no vertical crop) and keep a fixed window width.
+        // Reuse zoomFactor as "horizontal coverage" (0..1], where 1 means full width.
+        float coverage = tf->zoomFactor;
+        if (coverage <= 0.0f) coverage = 1.0f;
+        if (coverage > 1.0f)  coverage = 1.0f;
+
+        zh = (float)height;
+        zw = (float)width * coverage;
+
+        // Safety clamp: window cannot exceed frame.
+        if (zw > (float)width) zw = (float)width;
+        if (zw < 1.0f) zw = 1.0f;
+
+        // Choose target X based on preset (manual left/center/right or auto-follow group).
+        float maxZX = (float)width - zw;
+        if (maxZX < 0.0f) maxZX = 0.0f;
+
+        if (tf->x_pan_preset == "left") {
+                zx = 0.0f;
+        } else if (tf->x_pan_preset == "right") {
+                zx = maxZX;
+        } else if (tf->x_pan_preset == "center") {
+                zx = maxZX * 0.5f;
+	        } else if (tf->x_pan_preset == "autosnap" || tf->x_pan_preset == "autosnap_smooth") {
+	                // Auto-snap between Left/Center/Right with hysteresis to avoid micro-movements.
+                float targetCenterX = boundingBox.x + (boundingBox.width * 0.5f);
+                float norm = (width > 0) ? (targetCenterX / (float)width) : 0.5f;
+                float h = tf->x_snap_hysteresis;
+                if (h < 0.0f) h = 0.0f;
+                if (h > 0.20f) h = 0.20f;
+                const float t1 = 1.0f / 3.0f;
+                const float t2 = 2.0f / 3.0f;
+
+	                // Update snap state with hysteresis.
+	                const int prev_state = tf->x_snap_state;
+	                switch (tf->x_snap_state) {
+                case 0: // left
+                        if (norm > t1 + h) tf->x_snap_state = 1;
+                        break;
+                case 2: // right
+                        if (norm < t2 - h) tf->x_snap_state = 1;
+                        break;
+                case 1: // center
+                default:
+                        if (norm < t1 - h) tf->x_snap_state = 0;
+                        else if (norm > t2 + h) tf->x_snap_state = 2;
+                        break;
+                }
+
+	                // Target position for this snap state.
+	                float targetZX = (tf->x_snap_state == 0) ? 0.0f : (tf->x_snap_state == 2) ? maxZX : (maxZX * 0.5f);
+	                zx = targetZX;
+
+	                if (tf->x_pan_preset == "autosnap") {
+	                        // Hard snap: kill residual velocity every frame so it truly "snaps".
+	                        tf->trackVelX = 0.0f;
+	                } else {
+	                        // Smooth snap: only reset velocity when we change lane, to get a clean 200-300ms move.
+	                        if (tf->x_snap_state != prev_state)
+	                                tf->trackVelX = 0.0f;
+	                }
+        } else {
+                // Auto: center the window on the group's center X.
+                float targetCenterX = boundingBox.x + (boundingBox.width * 0.5f);
+                zx = targetCenterX - (zw * 0.5f);
+        }
+        zy = 0.0f;
+
+        // End-stops (fine corsa): clamp within [0, width-zw]
+        if (zx < 0.0f) zx = 0.0f;
+        if (zx > maxZX) zx = maxZX;
+} else {
+        // calculate an aspect ratio box around the object using its height
+        float boxHeight = boundingBox.height;
+        // calculate the zooming box size
+        float dh = (float)height - boxHeight;
+        float buffer = dh * (1.0f - tf->zoomFactor);
+        zh = boxHeight + buffer;
+        zw = zh * frameAspectRatio;
+        // calculate the top left corner of the zooming box
+        zx = boundingBox.x - (zw - boundingBox.width) / 2.0f;
+        zy = boundingBox.y - (zh - boundingBox.height) / 2.0f;
+}
+				// --- Optional X deadband (applies to ALL zoom_object modes) ---
+			if (tf->x_deadband > 0.0f) {
+				const float db_px = (tf->x_deadband / 100.0f) * (float)width;
+
+				if (tf->has_last_target_zx) {
+				const float dx = zx - tf->last_target_zx;
+					if (std::fabs(dx) < db_px) {
+						zx = tf->last_target_zx; // ignore micro jitter
+					} else {
+					tf->last_target_zx = zx;
+					}
+			} else {
+					tf->last_target_zx = zx;
+					tf->has_last_target_zx = true;
+			}
+}
+                if (tf->trackingRect.width == 0) {
+                        // initialize the trackingRect
+                        tf->trackingRect = cv::Rect2f(zx, zy, zw, zh);
+				tf->trackVelX = tf->trackVelY = tf->trackVelW = tf->trackVelH = 0.0f;
+                } else {
+                        // interpolate the zooming box to tf->trackingRect (frame-rate independent, low hysteresis)
+                        const float alpha60 = tf->zoomSpeedFactor * (lostTracking ? 0.2f : 1.0f);
+
+                        if (alpha60 <= 0.0f) {
+                        	// frozen
+                        } else if (alpha60 >= 1.0f) {
+                        	// snap
+                        	tf->trackingRect = cv::Rect2f(zx, zy, zw, zh);
+				tf->trackVelX = tf->trackVelY = tf->trackVelW = tf->trackVelH = 0.0f;
+                        	tf->trackVelX = tf->trackVelY = tf->trackVelW = tf->trackVelH = 0.0f;
+                        } else {
+
+	const float smoothTime = smooth_time_from_alpha60(alpha60);
+
+	if (tf->zoomObject == "group") {
+		// Pan-only X: smooth only the horizontal movement.
+			float smoothTimeX = smoothTime;
+			// Auto-snap (smooth): use an explicit transition time so moves take ~200-300ms regardless of FPS.
+			if (tf->x_pan_preset == "autosnap_smooth") {
+				smoothTimeX = std::clamp(tf->x_snap_transition_time, 0.05f, 1.0f);
+			}
+			tf->trackingRect.x = smooth_damp_critically_damped(tf->trackingRect.x, zx, tf->trackVelX,
+							   smoothTimeX, seconds);
+
+		// Keep fixed size and full height; no vertical movement.
+		tf->trackingRect.y = zy;
+		tf->trackingRect.width = zw;
+		tf->trackingRect.height = zh;
+
+		// Avoid accumulating velocities on unused axes.
+		tf->trackVelY = 0.0f;
+		tf->trackVelW = 0.0f;
+		tf->trackVelH = 0.0f;
+	} else {
+		tf->trackingRect.x = smooth_damp_critically_damped(tf->trackingRect.x, zx, tf->trackVelX,
+							   smoothTime, seconds);
+		tf->trackingRect.y = smooth_damp_critically_damped(tf->trackingRect.y, zy, tf->trackVelY,
+							   smoothTime, seconds);
+		tf->trackingRect.width =
+			smooth_damp_critically_damped(tf->trackingRect.width, zw, tf->trackVelW, smoothTime, seconds);
+		tf->trackingRect.height =
+			smooth_damp_critically_damped(tf->trackingRect.height, zh, tf->trackVelH, smoothTime, seconds);
 	}
+}
+}
+
+                // get the settings of the crop/pad filter
+			obs_data_t *crop_pad_settings = obs_source_get_settings(tf->trackingFilter);
+
+			// Clamp to valid crop values to avoid negative crop/pad inputs
+			const float x0 = std::max(0.0f, tf->trackingRect.x);
+			const float y0 = std::max(0.0f, tf->trackingRect.y);
+			const float x1 = std::min((float)width, tf->trackingRect.x + tf->trackingRect.width);
+			const float y1 = std::min((float)height, tf->trackingRect.y + tf->trackingRect.height);
+
+			const int left = (int)x0;
+			const int top = (int)y0;
+			const int right = (int)((float)width - x1);
+			const int bottom = (int)((float)height - y1);
+
+			obs_data_set_int(crop_pad_settings, "left", left);
+			obs_data_set_int(crop_pad_settings, "top", top);
+			obs_data_set_int(crop_pad_settings, "right", std::max(0, right));
+			obs_data_set_int(crop_pad_settings, "bottom", std::max(0, bottom));
+
+			// apply the settings
+                obs_source_update(tf->trackingFilter, crop_pad_settings);
+                obs_data_release(crop_pad_settings);
+        }
 }
 
 void detect_filter_video_render(void *data, gs_effect_t *_effect)
@@ -1053,7 +1732,7 @@ void detect_filter_video_render(void *data, gs_effect_t *_effect)
 
 	struct detect_filter *tf = reinterpret_cast<detect_filter *>(data);
 
-	if (tf->isDisabled || !tf->onnxruntimemodel) {
+	if (tf->isDisabled || !tf->model) {
 		if (tf->source) {
 			obs_source_skip_video_filter(tf->source);
 		}
