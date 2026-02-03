@@ -101,6 +101,8 @@ struct detect_filter : public filter_data {
 	bool cached_objects_valid = false;
 	std::vector<Object> cached_objects;
 
+	// Camera mode for 180° sources: "cam180_pan" (auto-crop) or "cam180_full" (no crop)
+	std::string camera_mode = "cam180_pan";
 	// Horizontal pan preset for group mode: "auto", "left", "center", "right"
 	std::string x_pan_preset = "auto";
 	// Auto-snap state (0=left,1=center,2=right) for "autosnap"
@@ -111,6 +113,16 @@ struct detect_filter : public filter_data {
 	float x_snap_hysteresis = 0.05f;
 	// Deadband on target X (percent of frame width). 0 disables.
 	float x_deadband = 0.0f;
+
+	// --- CAM-180° FULL: wide follow + edge-only zoom (conservative reframing) ---
+	// Base coverage when target is near the center (0..1], 1 = full width
+	float full_base_coverage = 0.95f;
+	// Minimum coverage when target approaches the horizontal edges (<= full_base_coverage)
+	float full_edge_coverage = 0.82f;
+	// Edge start threshold (normalized distance from center). 0 = always, 0.49 = almost never
+	float full_edge_start = 0.22f;
+	// Follow/zoom smoothness (same semantics as zoom_speed_factor: alpha at 60fps)
+	float full_follow_speed = 0.05f;
 	float last_target_zx = 0.0f;
 	bool has_last_target_zx = false;
 };
@@ -146,6 +158,74 @@ static bool enable_advanced_settings(obs_properties_t *ppts, obs_property_t *p,
 	}
 
 	return true;
+}
+
+
+// --- UI helpers: show options only for modes that use them ---
+static inline bool is_snap_mode(const char *mode)
+{
+	return mode && (strcmp(mode, "autosnap") == 0 || strcmp(mode, "autosnap_smooth") == 0);
+}
+
+static inline void update_tracking_ui_visibility(obs_properties_t *ppts, obs_data_t *settings)
+{
+	const bool enabled = obs_data_get_bool(settings, "tracking_group");
+	const char *cam = obs_data_get_string(settings, "camera_mode");
+	const bool pan_cam = (cam && strcmp(cam, "cam180_pan") == 0);
+	const bool full_cam = (cam && strcmp(cam, "cam180_full") == 0);
+	const char *mode = obs_data_get_string(settings, "x_pan_preset");
+	const bool snap = is_snap_mode(mode);
+
+	// Core controls always visible when Tracking is enabled
+	for (auto prop_name : {"camera_mode", "zoom_object", "infer_interval_ms", "infer_scale",
+			       "group_min_people", "group_min_people_strict"}) {
+		obs_property_t *prop = obs_properties_get(ppts, prop_name);
+		if (prop)
+			obs_property_set_visible(prop, enabled);
+	}
+
+	// Pan/crop controls only make sense for CAM-180° PAN
+	for (auto prop_name : {"zoom_factor", "zoom_speed_factor", "x_pan_preset"}) {
+		obs_property_t *prop = obs_properties_get(ppts, prop_name);
+		if (prop)
+			obs_property_set_visible(prop, enabled && pan_cam);
+	}
+
+
+	// CAM-180° FULL controls (wide follow + edge-only zoom)
+	for (auto prop_name : {"full_base_coverage", "full_edge_coverage", "full_edge_start", "full_follow_speed"}) {
+		obs_property_t *prop = obs_properties_get(ppts, prop_name);
+		if (prop)
+			obs_property_set_visible(prop, enabled && full_cam);
+	}
+
+	// Snap-related controls only visible for Auto-Snap modes
+	for (auto prop_name : {"x_snap_hysteresis", "x_snap_transition_time"}) {
+		obs_property_t *prop = obs_properties_get(ppts, prop_name);
+		if (prop)
+			obs_property_set_visible(prop, enabled && pan_cam && snap);
+	}
+
+	// Deadband applies to tracking movement, so only show it for CAM-180° PAN
+	{
+		obs_property_t *prop = obs_properties_get(ppts, "x_deadband");
+		if (prop)
+			obs_property_set_visible(prop, enabled && pan_cam);
+	}
+
+	// Cluster preview controls only make sense when ZoomObject == "group"
+	const char *zo = obs_data_get_string(settings, "zoom_object");
+	const bool is_group = (zo && strcmp(zo, "group") == 0);
+
+	obs_property_t *pgc = obs_properties_get(ppts, "preview_group_clusters");
+	if (pgc)
+		obs_property_set_visible(pgc, enabled && is_group);
+
+	obs_property_t *lbl = obs_properties_get(ppts, "preview_group_cluster_label");
+	if (lbl) {
+		const bool on = obs_data_get_bool(settings, "preview_group_clusters");
+		obs_property_set_visible(lbl, enabled && is_group && on);
+	}
 }
 
 void set_class_names_on_object_category(obs_property_t *object_category,
@@ -313,35 +393,22 @@ obs_properties_t *detect_filter_properties(void *data)
 	obs_property_set_modified_callback(tracking_group, [](obs_properties_t *props_,
 							      obs_property_t *,
 							      obs_data_t *settings) {
-		const bool enabled = obs_data_get_bool(settings, "tracking_group");
-
-		// Show/hide the core tracking controls when the group is enabled/disabled
-		for (auto prop_name : {"zoom_factor", "zoom_object", "zoom_speed_factor", "x_pan_preset",
-				       "x_snap_hysteresis", "x_snap_transition_time", "x_deadband", "infer_interval_ms", "infer_scale",
-				       "group_min_people", "group_min_people_strict"}) {
-			obs_property_t *prop = obs_properties_get(props_, prop_name);
-			if (prop)
-				obs_property_set_visible(prop, enabled);
-		}
-
-		// Cluster preview controls only make sense when ZoomObject == "group"
-		const char *zo = obs_data_get_string(settings, "zoom_object");
-		const bool is_group = (zo && strcmp(zo, "group") == 0);
-
-		obs_property_t *pgc = obs_properties_get(props_, "preview_group_clusters");
-		if (pgc)
-			obs_property_set_visible(pgc, enabled && is_group);
-
-		obs_property_t *lbl = obs_properties_get(props_, "preview_group_cluster_label");
-		if (lbl) {
-			const bool on = obs_data_get_bool(settings, "preview_group_clusters");
-			obs_property_set_visible(lbl, enabled && is_group && on);
-		}
-
+		update_tracking_ui_visibility(props_, settings);
 		return true;
 	});
 
-	// add zoom factor slider
+		// Camera-mode for 180° sources (macro mode)
+	obs_property_t *camera_mode = obs_properties_add_list(tracking_group_props, "camera_mode",
+							obs_module_text("CameraMode"),
+							OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(camera_mode, obs_module_text("Cam180Pan"), "cam180_pan");
+	obs_property_list_add_string(camera_mode, obs_module_text("Cam180Full"), "cam180_full");
+	obs_property_set_modified_callback(camera_mode, [](obs_properties_t *props_, obs_property_t *, obs_data_t *settings) {
+		update_tracking_ui_visibility(props_, settings);
+		return true;
+	});
+
+// add zoom factor slider
 	obs_properties_add_float_slider(tracking_group_props, "zoom_factor",
 					obs_module_text("ZoomFactor"), 0.0, 1.0, 0.05);
 
@@ -350,30 +417,48 @@ obs_properties_t *detect_filter_properties(void *data)
 
 	// Group pan preset: manual end-stops left/center/right (or auto follow)
 	obs_property_t *x_pan_preset = obs_properties_add_list(tracking_group_props, "x_pan_preset",
-							 obs_module_text("XPosition"),
+							 obs_module_text("PanModeX"),
 							 OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(x_pan_preset, obs_module_text("Auto"), "auto");
 	obs_property_list_add_string(x_pan_preset, obs_module_text("Left"), "left");
 	obs_property_list_add_string(x_pan_preset, obs_module_text("Center"), "center");
 	obs_property_list_add_string(x_pan_preset, obs_module_text("Right"), "right");
-	obs_property_list_add_string(x_pan_preset, obs_module_text("Auto Snap"), "autosnap");
-	obs_property_list_add_string(x_pan_preset, obs_module_text("Auto Snap (Smooth)"), "autosnap_smooth");
+	obs_property_list_add_string(x_pan_preset, obs_module_text("AutoSnap"), "autosnap");
+	obs_property_list_add_string(x_pan_preset, obs_module_text("AutoSnapSmooth"), "autosnap_smooth");
+
+	// Update visibility when mode changes (Auto vs Fixed vs Auto-Snap)
+	obs_property_set_modified_callback(x_pan_preset, [](obs_properties_t *props_, obs_property_t *, obs_data_t *settings) {
+		update_tracking_ui_visibility(props_, settings);
+		return true;
+	});
+
 
 	obs_properties_add_float_slider(tracking_group_props, "x_snap_hysteresis",
-					 obs_module_text("Snap Hysteresis"), 0.0, 0.20, 0.01);
+					 obs_module_text("AutoSnapHysteresis"), 0.0, 0.20, 0.01);
 
 	obs_properties_add_float_slider(tracking_group_props, "x_snap_transition_time",
-					 obs_module_text("Snap Transition (s)"), 0.05, 1.00, 0.05);
+					 obs_module_text("AutoSnapTransition"), 0.05, 1.00, 0.05);
 	
 	obs_properties_add_int_slider(tracking_group_props, "infer_interval_ms",
-			      obs_module_text("Infer Interval (ms)"), 0, 200, 5);
+			      obs_module_text("InferIntervalMs"), 0, 200, 5);
 
 	obs_properties_add_float_slider(tracking_group_props, "infer_scale",
-				obs_module_text("Infer Scale"), 0.25, 1.00, 0.05);
+				obs_module_text("InferDownscale"), 0.25, 1.00, 0.05);
 
 	
 	obs_properties_add_float_slider(tracking_group_props, "x_deadband",
-				obs_module_text("X Deadband (%)"), 0.0, 5.0, 0.1);
+				obs_module_text("TrackingDeadbandPct"), 0.0, 5.0, 0.1);
+
+
+	// CAM-180° FULL: conservative follow + edge-only zoom parameters
+	obs_properties_add_float_slider(tracking_group_props, "full_base_coverage",
+					obs_module_text("FullBaseCoverage"), 0.70, 1.0, 0.01);
+	obs_properties_add_float_slider(tracking_group_props, "full_edge_coverage",
+					obs_module_text("FullEdgeCoverage"), 0.60, 1.0, 0.01);
+	obs_properties_add_float_slider(tracking_group_props, "full_edge_start",
+					obs_module_text("FullEdgeStart"), 0.00, 0.49, 0.01);
+	obs_properties_add_float_slider(tracking_group_props, "full_follow_speed",
+					obs_module_text("FullFollowSpeed"), 0.00, 0.20, 0.01);
 
 	// add object selection for zoom drop down: "Single", "All"
 	obs_property_t *zoom_object = obs_properties_add_list(tracking_group_props, "zoom_object",
@@ -386,6 +471,13 @@ obs_properties_t *detect_filter_properties(void *data)
 	obs_property_list_add_string(zoom_object, obs_module_text("All"), "all");
 	//mod x basket
 	obs_property_list_add_string(zoom_object, obs_module_text("Group"), "group");
+
+	// Update visibility when zoom target changes (group-only controls)
+	obs_property_set_modified_callback(zoom_object, [](obs_properties_t *props_, obs_property_t *, obs_data_t *settings) {
+		update_tracking_ui_visibility(props_, settings);
+		return true;
+	});
+
 obs_property_set_modified_callback(zoom_object, [](obs_properties_t *props_, obs_property_t *, obs_data_t *settings) {
 		// When switching ZoomObject, show cluster preview controls only for "group"
 		const bool enabled = obs_data_get_bool(settings, "tracking_group");
@@ -404,12 +496,19 @@ obs_property_set_modified_callback(zoom_object, [](obs_properties_t *props_, obs
 		return true;
 	});
 
-	obs_properties_add_int(tracking_group_props, "group_min_people", "Group min people", 1, 15, 1);
-	obs_properties_add_bool(tracking_group_props, "group_min_people_strict", "Strict min people");
+	obs_properties_add_int(tracking_group_props, "group_min_people", obs_module_text("GroupMinPeople"), 1, 15, 1);
+	obs_properties_add_bool(tracking_group_props, "group_min_people_strict", obs_module_text("GroupMinPeopleStrict"));
 	obs_property_t *preview_group_clusters =
-		obs_properties_add_bool(tracking_group_props, "preview_group_clusters", "Preview group cluster");
+		obs_properties_add_bool(tracking_group_props, "preview_group_clusters", obs_module_text("PreviewGroupClusters"));
 	obs_property_t *preview_group_cluster_label =
-		obs_properties_add_bool(tracking_group_props, "preview_group_cluster_label", "Show group cluster label");
+		obs_properties_add_bool(tracking_group_props, "preview_group_cluster_label", obs_module_text("PreviewGroupClusterLabel"));
+
+	// Update visibility when cluster preview checkbox toggles (show/hide its label option)
+	obs_property_set_modified_callback(preview_group_clusters, [](obs_properties_t *props_, obs_property_t *, obs_data_t *settings) {
+		update_tracking_ui_visibility(props_, settings);
+		return true;
+	});
+
 	// Initial visibility: detect_filter_properties() has no access to current settings -> start hidden.
 	obs_property_set_visible(preview_group_clusters, false);
 	obs_property_set_visible(preview_group_cluster_label, false);
@@ -614,6 +713,7 @@ void detect_filter_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "masking_blur_radius", 0);
 	obs_data_set_default_int(settings, "dilation_iterations", 0);
 	obs_data_set_default_bool(settings, "tracking_group", false);
+	obs_data_set_default_string(settings, "camera_mode", "cam180_pan");
 	obs_data_set_default_double(settings, "zoom_factor", 0.0);
 	obs_data_set_default_double(settings, "zoom_speed_factor", 0.05);
 	obs_data_set_default_string(settings, "zoom_object", "single");
@@ -627,6 +727,10 @@ void detect_filter_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, "x_snap_hysteresis", 0.05);
 	obs_data_set_default_double(settings, "x_snap_transition_time", 0.25);
 	obs_data_set_default_double(settings, "x_deadband", 0.0);
+	obs_data_set_default_double(settings, "full_base_coverage", 0.95);
+	obs_data_set_default_double(settings, "full_edge_coverage", 0.82);
+	obs_data_set_default_double(settings, "full_edge_start", 0.22);
+	obs_data_set_default_double(settings, "full_follow_speed", 0.05);
 	obs_data_set_default_string(settings, "save_detections_path", "");
 	obs_data_set_default_bool(settings, "crop_group", false);
 	obs_data_set_default_int(settings, "crop_left", 0);
@@ -653,6 +757,7 @@ void detect_filter_update(void *data, obs_data_t *settings)
 	tf->maskingDilateIterations = (int)obs_data_get_int(settings, "dilation_iterations");
 
 	bool newTrackingEnabled = obs_data_get_bool(settings, "tracking_group");
+	tf->camera_mode = obs_data_get_string(settings, "camera_mode");
 	tf->zoomFactor = (float)obs_data_get_double(settings, "zoom_factor");
 	tf->zoomSpeedFactor = (float)obs_data_get_double(settings, "zoom_speed_factor");
 	tf->zoomObject = obs_data_get_string(settings, "zoom_object");
@@ -678,6 +783,16 @@ void detect_filter_update(void *data, obs_data_t *settings)
 
 	tf->x_deadband = (float)obs_data_get_double(settings, "x_deadband");
 	tf->x_deadband = std::clamp(tf->x_deadband, 0.0f, 5.0f);
+
+	tf->full_base_coverage = (float)obs_data_get_double(settings, "full_base_coverage");
+	tf->full_base_coverage = std::clamp(tf->full_base_coverage, 0.70f, 1.0f);
+	tf->full_edge_coverage = (float)obs_data_get_double(settings, "full_edge_coverage");
+	tf->full_edge_coverage = std::clamp(tf->full_edge_coverage, 0.60f, tf->full_base_coverage);
+	tf->full_edge_start = (float)obs_data_get_double(settings, "full_edge_start");
+	tf->full_edge_start = std::clamp(tf->full_edge_start, 0.0f, 0.49f);
+	tf->full_follow_speed = (float)obs_data_get_double(settings, "full_follow_speed");
+	tf->full_follow_speed = std::clamp(tf->full_follow_speed, 0.0f, 1.0f);
+
 	tf->has_last_target_zx = false; // reset safe when settings change
 
 
@@ -1550,7 +1665,64 @@ float frameAspectRatio = (float)width / (float)height;
 
 float zx = 0.0f, zy = 0.0f, zw = 0.0f, zh = 0.0f;
 
-if (tf->zoomObject == "group") {
+// CAM-180° FULL: conservative follow (X+Y) + edge-only zoom (wide at center, slight zoom near edges)
+if (tf->camera_mode == "cam180_full") {
+	// If we have no valid target, fall back to centered wide view.
+	float targetCenterX = (float)width * 0.5f;
+	float targetCenterY = (float)height * 0.5f;
+	if (!lostTracking) {
+		targetCenterX = boundingBox.x + (boundingBox.width * 0.5f);
+		targetCenterY = boundingBox.y + (boundingBox.height * 0.5f);
+	}
+
+	// Edge-only zoom is driven by horizontal distance from the center of the 180° frame.
+	const float nx = (width > 0) ? (targetCenterX / (float)width) : 0.5f;
+	const float d = std::fabs(nx - 0.5f); // 0 center, 0.5 edges
+
+	float edgeStart = tf->full_edge_start;
+	edgeStart = std::clamp(edgeStart, 0.0f, 0.49f);
+
+	float e = 0.0f;
+	if (d > edgeStart && (0.5f - edgeStart) > 1e-6f)
+		e = (d - edgeStart) / (0.5f - edgeStart);
+
+	e = std::clamp(e, 0.0f, 1.0f);
+	// Smoothstep (so it doesn't "kick" when crossing edgeStart)
+	const float e2 = e * e * (3.0f - 2.0f * e);
+
+	float baseCoverage = tf->full_base_coverage;
+	baseCoverage = std::clamp(baseCoverage, 0.70f, 1.0f);
+	float edgeCoverage = tf->full_edge_coverage;
+	edgeCoverage = std::clamp(edgeCoverage, 0.60f, baseCoverage);
+
+	// Wide at center (baseCoverage), zoom in slightly near edges (edgeCoverage).
+	const float coverage = baseCoverage - (baseCoverage - edgeCoverage) * e2;
+
+	zw = (float)width * coverage;
+	if (zw < 1.0f) zw = 1.0f;
+
+	// Keep 16:9 output crop.
+	const float outAspect = 16.0f / 9.0f;
+	zh = zw / outAspect;
+
+	// Safety: if height is too small for that width, clamp by height.
+	if (zh > (float)height) {
+		zh = (float)height;
+		zw = zh * outAspect;
+	}
+
+	// Center crop on target (follow X+Y), then clamp in-frame.
+	zx = targetCenterX - (zw * 0.5f);
+	zy = targetCenterY - (zh * 0.5f);
+
+	const float maxZX = (float)width - zw;
+	const float maxZY = (float)height - zh;
+	zx = std::clamp(zx, 0.0f, (maxZX < 0.0f) ? 0.0f : maxZX);
+	zy = std::clamp(zy, 0.0f, (maxZY < 0.0f) ? 0.0f : maxZY);
+
+	// Reset deadband memory so switching modes doesn't stick
+	tf->has_last_target_zx = false;
+} else if (tf->zoomObject == "group") {
         // Pan-only on X: keep full height (no vertical crop) and keep a fixed window width.
         // Reuse zoomFactor as "horizontal coverage" (0..1], where 1 means full width.
         float coverage = tf->zoomFactor;
@@ -1579,6 +1751,9 @@ if (tf->zoomObject == "group") {
                 float targetCenterX = boundingBox.x + (boundingBox.width * 0.5f);
                 float norm = (width > 0) ? (targetCenterX / (float)width) : 0.5f;
                 float h = tf->x_snap_hysteresis;
+                // Make hysteresis relative to the output crop width (zw)
+                if (width > 0 && zw > 0)
+                        h = h * (zw / (float)width);
                 if (h < 0.0f) h = 0.0f;
                 if (h > 0.20f) h = 0.20f;
                 const float t1 = 1.0f / 3.0f;
@@ -1636,7 +1811,7 @@ if (tf->zoomObject == "group") {
 }
 				// --- Optional X deadband (applies to ALL zoom_object modes) ---
 			if (tf->x_deadband > 0.0f) {
-				const float db_px = (tf->x_deadband / 100.0f) * (float)width;
+				const float db_px = (tf->x_deadband / 100.0f) * zw; // relative to output crop width
 
 				if (tf->has_last_target_zx) {
 				const float dx = zx - tf->last_target_zx;
@@ -1656,7 +1831,8 @@ if (tf->zoomObject == "group") {
 				tf->trackVelX = tf->trackVelY = tf->trackVelW = tf->trackVelH = 0.0f;
                 } else {
                         // interpolate the zooming box to tf->trackingRect (frame-rate independent, low hysteresis)
-                        const float alpha60 = tf->zoomSpeedFactor * (lostTracking ? 0.2f : 1.0f);
+                        const float baseAlpha60 = (tf->camera_mode == "cam180_full") ? tf->full_follow_speed : tf->zoomSpeedFactor;
+						const float alpha60 = baseAlpha60 * (lostTracking ? 0.2f : 1.0f);
 
                         if (alpha60 <= 0.0f) {
                         	// frozen
