@@ -78,6 +78,55 @@ static inline float smooth_time_from_alpha60(float alpha_per_frame_60fps)
 	return std::max(0.0001f, 2.0f / k);        // map to spring smoothTime via omega=2/smoothTime
 }
 
+
+struct RectI { int x, y, w, h; };
+
+static inline RectI make_safe_roi(int w, int h, int lPct, int rPct, int tPct, int bPct)
+{
+	const int l = (w * lPct) / 100;
+	const int r = (w * rPct) / 100;
+	const int t = (h * tPct) / 100;
+	const int b = (h * bPct) / 100;
+
+	RectI rc;
+	rc.x = l;
+	rc.y = t;
+	rc.w = std::max(1, w - l - r);
+	rc.h = std::max(1, h - t - b);
+	return rc;
+}
+
+static inline bool point_in_rect(float px, float py, const RectI &r)
+{
+	return px >= (float)r.x && py >= (float)r.y && px < (float)(r.x + r.w) && py < (float)(r.y + r.h);
+}
+
+static inline bool obj_center_in_safe(const Object &obj, const RectI &safe)
+{
+	const float cx = obj.rect.x + obj.rect.width * 0.5f;
+	const float cy = obj.rect.y + obj.rect.height * 0.5f;
+	return point_in_rect(cx, cy, safe);
+}
+
+static inline bool rect_valid(const cv::Rect2f &r)
+{
+	return r.width > 1.0f && r.height > 1.0f;
+}
+
+
+static inline float rect_center_dist(const cv::Rect2f &a, const cv::Rect2f &b)
+{
+	const float ax = a.x + a.width * 0.5f;
+	const float ay = a.y + a.height * 0.5f;
+	const float bx = b.x + b.width * 0.5f;
+	const float by = b.y + b.height * 0.5f;
+	const float dx = ax - bx;
+	const float dy = ay - by;
+	return std::sqrt(dx * dx + dy * dy);
+}
+
+
+
 struct detect_filter : public filter_data {
 	// SmoothDamp velocities for trackingRect (x, y, w, h)
 	float trackVelX = 0.0f;
@@ -86,8 +135,42 @@ struct detect_filter : public filter_data {
 	float trackVelH = 0.0f;
 	int groupMinPeople = 6;
 	bool groupMinPeopleStrict = false;
+	float groupMaxDistFrac = 0.15f; // max distance between people (fraction of frame width)
 	bool previewGroupClusters = false;
 	bool previewGroupClusterLabel = false;
+
+	// Safe ROI (decision region) margins in percent (used only for crop decision, not inference)
+	int safe_roi_left = 10;
+	int safe_roi_right = 10;
+	int safe_roi_top = 0;
+	int safe_roi_bottom = 8;
+
+	// Safe ROI hold-before-fallback (ms)
+	int safe_roi_hold_ms = 300;
+	int safe_roi_hold_timer_ms = 0;
+	bool safe_roi_holding = false;
+	uint64_t safe_roi_hold_until_ns = 0;
+	cv::Rect2f safe_roi_last_good_bbox = cv::Rect2f(0, 0, 0, 0);
+
+	// Debug/preview: bbox used to drive crop decision
+	cv::Rect2f safe_roi_decision_bbox = cv::Rect2f(0, 0, 0, 0);
+	bool safe_roi_decision_from_safe = false;
+	bool safe_roi_decision_is_hold = false;
+
+
+	// Cluster temporal inertia (ms): delay before switching to a different best cluster
+	int cluster_inertia_ms = 150;
+
+	uint64_t cluster_pending_since_ns = 0;
+	cv::Rect2f cluster_pending_box = cv::Rect2f(0, 0, 0, 0);
+
+	cv::Rect2f cluster_active_box = cv::Rect2f(0, 0, 0, 0);
+	bool cluster_active_valid = false;
+
+	// Debug/preview: cluster inertia state
+	bool cluster_inertia_pending = false;
+
+
 	// Cache/throttle for group bbox selection (crop)
 	uint64_t lastGroupBoxTsNs = 0;
 	cv::Rect2f lastGroupBox;
@@ -101,8 +184,6 @@ struct detect_filter : public filter_data {
 	bool cached_objects_valid = false;
 	std::vector<Object> cached_objects;
 
-	// Camera mode for 180° sources: "cam180_pan" (auto-crop) or "cam180_full" (no crop)
-	std::string camera_mode = "cam180_pan";
 	// Horizontal pan preset for group mode: "auto", "left", "center", "right"
 	std::string x_pan_preset = "auto";
 	// Auto-snap state (0=left,1=center,2=right) for "autosnap"
@@ -113,16 +194,6 @@ struct detect_filter : public filter_data {
 	float x_snap_hysteresis = 0.05f;
 	// Deadband on target X (percent of frame width). 0 disables.
 	float x_deadband = 0.0f;
-
-	// --- CAM-180° FULL: wide follow + edge-only zoom (conservative reframing) ---
-	// Base coverage when target is near the center (0..1], 1 = full width
-	float full_base_coverage = 0.95f;
-	// Minimum coverage when target approaches the horizontal edges (<= full_base_coverage)
-	float full_edge_coverage = 0.82f;
-	// Edge start threshold (normalized distance from center). 0 = always, 0.49 = almost never
-	float full_edge_start = 0.22f;
-	// Follow/zoom smoothness (same semantics as zoom_speed_factor: alpha at 60fps)
-	float full_follow_speed = 0.05f;
 	float last_target_zx = 0.0f;
 	bool has_last_target_zx = false;
 };
@@ -158,74 +229,6 @@ static bool enable_advanced_settings(obs_properties_t *ppts, obs_property_t *p,
 	}
 
 	return true;
-}
-
-
-// --- UI helpers: show options only for modes that use them ---
-static inline bool is_snap_mode(const char *mode)
-{
-	return mode && (strcmp(mode, "autosnap") == 0 || strcmp(mode, "autosnap_smooth") == 0);
-}
-
-static inline void update_tracking_ui_visibility(obs_properties_t *ppts, obs_data_t *settings)
-{
-	const bool enabled = obs_data_get_bool(settings, "tracking_group");
-	const char *cam = obs_data_get_string(settings, "camera_mode");
-	const bool pan_cam = (cam && strcmp(cam, "cam180_pan") == 0);
-	const bool full_cam = (cam && strcmp(cam, "cam180_full") == 0);
-	const char *mode = obs_data_get_string(settings, "x_pan_preset");
-	const bool snap = is_snap_mode(mode);
-
-	// Core controls always visible when Tracking is enabled
-	for (auto prop_name : {"camera_mode", "zoom_object", "infer_interval_ms", "infer_scale",
-			       "group_min_people", "group_min_people_strict"}) {
-		obs_property_t *prop = obs_properties_get(ppts, prop_name);
-		if (prop)
-			obs_property_set_visible(prop, enabled);
-	}
-
-	// Pan/crop controls only make sense for CAM-180° PAN
-	for (auto prop_name : {"zoom_factor", "zoom_speed_factor", "x_pan_preset"}) {
-		obs_property_t *prop = obs_properties_get(ppts, prop_name);
-		if (prop)
-			obs_property_set_visible(prop, enabled && pan_cam);
-	}
-
-
-	// CAM-180° FULL controls (wide follow + edge-only zoom)
-	for (auto prop_name : {"full_base_coverage", "full_edge_coverage", "full_edge_start", "full_follow_speed"}) {
-		obs_property_t *prop = obs_properties_get(ppts, prop_name);
-		if (prop)
-			obs_property_set_visible(prop, enabled && full_cam);
-	}
-
-	// Snap-related controls only visible for Auto-Snap modes
-	for (auto prop_name : {"x_snap_hysteresis", "x_snap_transition_time"}) {
-		obs_property_t *prop = obs_properties_get(ppts, prop_name);
-		if (prop)
-			obs_property_set_visible(prop, enabled && pan_cam && snap);
-	}
-
-	// Deadband applies to tracking movement, so only show it for CAM-180° PAN
-	{
-		obs_property_t *prop = obs_properties_get(ppts, "x_deadband");
-		if (prop)
-			obs_property_set_visible(prop, enabled && pan_cam);
-	}
-
-	// Cluster preview controls only make sense when ZoomObject == "group"
-	const char *zo = obs_data_get_string(settings, "zoom_object");
-	const bool is_group = (zo && strcmp(zo, "group") == 0);
-
-	obs_property_t *pgc = obs_properties_get(ppts, "preview_group_clusters");
-	if (pgc)
-		obs_property_set_visible(pgc, enabled && is_group);
-
-	obs_property_t *lbl = obs_properties_get(ppts, "preview_group_cluster_label");
-	if (lbl) {
-		const bool on = obs_data_get_bool(settings, "preview_group_clusters");
-		obs_property_set_visible(lbl, enabled && is_group && on);
-	}
 }
 
 void set_class_names_on_object_category(obs_property_t *object_category,
@@ -393,22 +396,48 @@ obs_properties_t *detect_filter_properties(void *data)
 	obs_property_set_modified_callback(tracking_group, [](obs_properties_t *props_,
 							      obs_property_t *,
 							      obs_data_t *settings) {
-		update_tracking_ui_visibility(props_, settings);
+		const bool enabled = obs_data_get_bool(settings, "tracking_group");
+
+		// Show/hide the core tracking controls when the group is enabled/disabled
+		for (auto prop_name : {"zoom_factor", "zoom_object", "zoom_speed_factor", "x_pan_preset",
+				       "x_snap_hysteresis", "x_snap_transition_time", "x_deadband", "infer_interval_ms", "infer_scale",
+				       "group_min_people", "group_min_people_strict", "safe_roi_left", "safe_roi_right", "safe_roi_top", "safe_roi_bottom", "safe_roi_hold_ms", "cluster_inertia_ms"}) {
+			obs_property_t *prop = obs_properties_get(props_, prop_name);
+			if (prop)
+				obs_property_set_visible(prop, enabled);
+		}
+
+		// Cluster preview controls only make sense when ZoomObject == "group"
+		const char *zo = obs_data_get_string(settings, "zoom_object");
+		const bool is_group = (zo && strcmp(zo, "group") == 0);
+
+		obs_property_t *gmp = obs_properties_get(props_, "group_min_people");
+		if (gmp)
+			obs_property_set_visible(gmp, enabled && is_group);
+
+		obs_property_t *gms = obs_properties_get(props_, "group_min_people_strict");
+		if (gms)
+			obs_property_set_visible(gms, enabled && is_group);
+
+		obs_property_t *gmd = obs_properties_get(props_, "group_max_dist_frac");
+		if (gmd)
+			obs_property_set_visible(gmd, enabled && is_group);
+
+
+		obs_property_t *pgc = obs_properties_get(props_, "preview_group_clusters");
+		if (pgc)
+			obs_property_set_visible(pgc, enabled && is_group);
+
+		obs_property_t *lbl = obs_properties_get(props_, "preview_group_cluster_label");
+		if (lbl) {
+			const bool on = obs_data_get_bool(settings, "preview_group_clusters");
+			obs_property_set_visible(lbl, enabled && is_group && on);
+		}
+
 		return true;
 	});
 
-		// Camera-mode for 180° sources (macro mode)
-	obs_property_t *camera_mode = obs_properties_add_list(tracking_group_props, "camera_mode",
-							obs_module_text("CameraMode"),
-							OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
-	obs_property_list_add_string(camera_mode, obs_module_text("Cam180Pan"), "cam180_pan");
-	obs_property_list_add_string(camera_mode, obs_module_text("Cam180Full"), "cam180_full");
-	obs_property_set_modified_callback(camera_mode, [](obs_properties_t *props_, obs_property_t *, obs_data_t *settings) {
-		update_tracking_ui_visibility(props_, settings);
-		return true;
-	});
-
-// add zoom factor slider
+	// add zoom factor slider
 	obs_properties_add_float_slider(tracking_group_props, "zoom_factor",
 					obs_module_text("ZoomFactor"), 0.0, 1.0, 0.05);
 
@@ -417,48 +446,30 @@ obs_properties_t *detect_filter_properties(void *data)
 
 	// Group pan preset: manual end-stops left/center/right (or auto follow)
 	obs_property_t *x_pan_preset = obs_properties_add_list(tracking_group_props, "x_pan_preset",
-							 obs_module_text("PanModeX"),
+							 obs_module_text("XPosition"),
 							 OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(x_pan_preset, obs_module_text("Auto"), "auto");
 	obs_property_list_add_string(x_pan_preset, obs_module_text("Left"), "left");
 	obs_property_list_add_string(x_pan_preset, obs_module_text("Center"), "center");
 	obs_property_list_add_string(x_pan_preset, obs_module_text("Right"), "right");
-	obs_property_list_add_string(x_pan_preset, obs_module_text("AutoSnap"), "autosnap");
-	obs_property_list_add_string(x_pan_preset, obs_module_text("AutoSnapSmooth"), "autosnap_smooth");
-
-	// Update visibility when mode changes (Auto vs Fixed vs Auto-Snap)
-	obs_property_set_modified_callback(x_pan_preset, [](obs_properties_t *props_, obs_property_t *, obs_data_t *settings) {
-		update_tracking_ui_visibility(props_, settings);
-		return true;
-	});
-
+	obs_property_list_add_string(x_pan_preset, obs_module_text("Auto Snap"), "autosnap");
+	obs_property_list_add_string(x_pan_preset, obs_module_text("Auto Snap (Smooth)"), "autosnap_smooth");
 
 	obs_properties_add_float_slider(tracking_group_props, "x_snap_hysteresis",
-					 obs_module_text("AutoSnapHysteresis"), 0.0, 0.20, 0.01);
+					 obs_module_text("Snap Hysteresis"), 0.0, 0.20, 0.01);
 
 	obs_properties_add_float_slider(tracking_group_props, "x_snap_transition_time",
-					 obs_module_text("AutoSnapTransition"), 0.05, 1.00, 0.05);
+					 obs_module_text("Snap Transition (s)"), 0.05, 1.00, 0.05);
 	
 	obs_properties_add_int_slider(tracking_group_props, "infer_interval_ms",
-			      obs_module_text("InferIntervalMs"), 0, 200, 5);
+			      obs_module_text("Infer Interval (ms)"), 0, 200, 5);
 
 	obs_properties_add_float_slider(tracking_group_props, "infer_scale",
-				obs_module_text("InferDownscale"), 0.25, 1.00, 0.05);
+				obs_module_text("Infer Scale"), 0.25, 1.00, 0.05);
 
 	
 	obs_properties_add_float_slider(tracking_group_props, "x_deadband",
-				obs_module_text("TrackingDeadbandPct"), 0.0, 5.0, 0.1);
-
-
-	// CAM-180° FULL: conservative follow + edge-only zoom parameters
-	obs_properties_add_float_slider(tracking_group_props, "full_base_coverage",
-					obs_module_text("FullBaseCoverage"), 0.70, 1.0, 0.01);
-	obs_properties_add_float_slider(tracking_group_props, "full_edge_coverage",
-					obs_module_text("FullEdgeCoverage"), 0.60, 1.0, 0.01);
-	obs_properties_add_float_slider(tracking_group_props, "full_edge_start",
-					obs_module_text("FullEdgeStart"), 0.00, 0.49, 0.01);
-	obs_properties_add_float_slider(tracking_group_props, "full_follow_speed",
-					obs_module_text("FullFollowSpeed"), 0.00, 0.20, 0.01);
+				obs_module_text("X Deadband (%)"), 0.0, 5.0, 0.1);
 
 	// add object selection for zoom drop down: "Single", "All"
 	obs_property_t *zoom_object = obs_properties_add_list(tracking_group_props, "zoom_object",
@@ -471,13 +482,6 @@ obs_properties_t *detect_filter_properties(void *data)
 	obs_property_list_add_string(zoom_object, obs_module_text("All"), "all");
 	//mod x basket
 	obs_property_list_add_string(zoom_object, obs_module_text("Group"), "group");
-
-	// Update visibility when zoom target changes (group-only controls)
-	obs_property_set_modified_callback(zoom_object, [](obs_properties_t *props_, obs_property_t *, obs_data_t *settings) {
-		update_tracking_ui_visibility(props_, settings);
-		return true;
-	});
-
 obs_property_set_modified_callback(zoom_object, [](obs_properties_t *props_, obs_property_t *, obs_data_t *settings) {
 		// When switching ZoomObject, show cluster preview controls only for "group"
 		const bool enabled = obs_data_get_bool(settings, "tracking_group");
@@ -496,19 +500,20 @@ obs_property_set_modified_callback(zoom_object, [](obs_properties_t *props_, obs
 		return true;
 	});
 
-	obs_properties_add_int(tracking_group_props, "group_min_people", obs_module_text("GroupMinPeople"), 1, 15, 1);
-	obs_properties_add_bool(tracking_group_props, "group_min_people_strict", obs_module_text("GroupMinPeopleStrict"));
+	obs_properties_add_int(tracking_group_props, "group_min_people", "Group min people", 1, 15, 1);
+obs_properties_add_float_slider(tracking_group_props, "group_max_dist_frac", obs_module_text("GroupMaxDistFrac"), 0.05, 0.50, 0.01);
+
+	obs_properties_add_int(tracking_group_props, "safe_roi_left", "Safe ROI Left Margin (%)", 0, 40, 1);
+	obs_properties_add_int(tracking_group_props, "safe_roi_right", "Safe ROI Right Margin (%)", 0, 40, 1);
+	obs_properties_add_int(tracking_group_props, "safe_roi_top", "Safe ROI Top Margin (%)", 0, 40, 1);
+	obs_properties_add_int(tracking_group_props, "safe_roi_bottom", "Safe ROI Bottom Margin (%)", 0, 40, 1);
+	obs_properties_add_int(tracking_group_props, "safe_roi_hold_ms", "Safe ROI Hold (ms)", 0, 2000, 50);
+	obs_properties_add_int_slider(tracking_group_props, "cluster_inertia_ms", "Cluster inertia (ms)", 0, 2000, 25);
+		obs_properties_add_bool(tracking_group_props, "group_min_people_strict", "Strict min people");
 	obs_property_t *preview_group_clusters =
-		obs_properties_add_bool(tracking_group_props, "preview_group_clusters", obs_module_text("PreviewGroupClusters"));
+		obs_properties_add_bool(tracking_group_props, "preview_group_clusters", "Preview group cluster");
 	obs_property_t *preview_group_cluster_label =
-		obs_properties_add_bool(tracking_group_props, "preview_group_cluster_label", obs_module_text("PreviewGroupClusterLabel"));
-
-	// Update visibility when cluster preview checkbox toggles (show/hide its label option)
-	obs_property_set_modified_callback(preview_group_clusters, [](obs_properties_t *props_, obs_property_t *, obs_data_t *settings) {
-		update_tracking_ui_visibility(props_, settings);
-		return true;
-	});
-
+		obs_properties_add_bool(tracking_group_props, "preview_group_cluster_label", "Show group cluster label");
 	// Initial visibility: detect_filter_properties() has no access to current settings -> start hidden.
 	obs_property_set_visible(preview_group_clusters, false);
 	obs_property_set_visible(preview_group_cluster_label, false);
@@ -713,7 +718,6 @@ void detect_filter_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "masking_blur_radius", 0);
 	obs_data_set_default_int(settings, "dilation_iterations", 0);
 	obs_data_set_default_bool(settings, "tracking_group", false);
-	obs_data_set_default_string(settings, "camera_mode", "cam180_pan");
 	obs_data_set_default_double(settings, "zoom_factor", 0.0);
 	obs_data_set_default_double(settings, "zoom_speed_factor", 0.05);
 	obs_data_set_default_string(settings, "zoom_object", "single");
@@ -722,15 +726,18 @@ void detect_filter_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, "infer_scale", 1.0);
 	obs_data_set_default_int(settings, "group_min_people", 6);
 	obs_data_set_default_bool(settings, "group_min_people_strict", false);
+	obs_data_set_default_double(settings, "group_max_dist_frac", 0.15);
+	obs_data_set_default_int(settings, "safe_roi_left", 10);
+	obs_data_set_default_int(settings, "safe_roi_right", 10);
+	obs_data_set_default_int(settings, "safe_roi_top", 0);
+	obs_data_set_default_int(settings, "safe_roi_bottom", 8);
+	obs_data_set_default_int(settings, "safe_roi_hold_ms", 300);
+	obs_data_set_default_int(settings, "cluster_inertia_ms", 150);
 	obs_data_set_default_bool(settings, "preview_group_clusters", false);
 	obs_data_set_default_bool(settings, "preview_group_cluster_label", false);
 	obs_data_set_default_double(settings, "x_snap_hysteresis", 0.05);
 	obs_data_set_default_double(settings, "x_snap_transition_time", 0.25);
 	obs_data_set_default_double(settings, "x_deadband", 0.0);
-	obs_data_set_default_double(settings, "full_base_coverage", 0.95);
-	obs_data_set_default_double(settings, "full_edge_coverage", 0.82);
-	obs_data_set_default_double(settings, "full_edge_start", 0.22);
-	obs_data_set_default_double(settings, "full_follow_speed", 0.05);
 	obs_data_set_default_string(settings, "save_detections_path", "");
 	obs_data_set_default_bool(settings, "crop_group", false);
 	obs_data_set_default_int(settings, "crop_left", 0);
@@ -757,7 +764,6 @@ void detect_filter_update(void *data, obs_data_t *settings)
 	tf->maskingDilateIterations = (int)obs_data_get_int(settings, "dilation_iterations");
 
 	bool newTrackingEnabled = obs_data_get_bool(settings, "tracking_group");
-	tf->camera_mode = obs_data_get_string(settings, "camera_mode");
 	tf->zoomFactor = (float)obs_data_get_double(settings, "zoom_factor");
 	tf->zoomSpeedFactor = (float)obs_data_get_double(settings, "zoom_speed_factor");
 	tf->zoomObject = obs_data_get_string(settings, "zoom_object");
@@ -765,6 +771,22 @@ void detect_filter_update(void *data, obs_data_t *settings)
 	tf->groupMinPeople = (int)obs_data_get_int(settings, "group_min_people");
 	tf->groupMinPeople = std::max(1, tf->groupMinPeople);
 	tf->groupMinPeopleStrict = obs_data_get_bool(settings, "group_min_people_strict");
+	tf->groupMaxDistFrac = (float)obs_data_get_double(settings, "group_max_dist_frac");
+	tf->groupMaxDistFrac = std::clamp(tf->groupMaxDistFrac, 0.05f, 0.50f);
+
+	tf->safe_roi_left = (int)obs_data_get_int(settings, "safe_roi_left");
+	tf->safe_roi_right = (int)obs_data_get_int(settings, "safe_roi_right");
+	tf->safe_roi_top = (int)obs_data_get_int(settings, "safe_roi_top");
+	tf->safe_roi_bottom = (int)obs_data_get_int(settings, "safe_roi_bottom");
+	tf->safe_roi_hold_ms = (int)obs_data_get_int(settings, "safe_roi_hold_ms");
+	tf->cluster_inertia_ms = (int)obs_data_get_int(settings, "cluster_inertia_ms");
+
+	tf->safe_roi_left = std::clamp(tf->safe_roi_left, 0, 40);
+	tf->safe_roi_right = std::clamp(tf->safe_roi_right, 0, 40);
+	tf->safe_roi_top = std::clamp(tf->safe_roi_top, 0, 40);
+	tf->safe_roi_bottom = std::clamp(tf->safe_roi_bottom, 0, 40);
+	tf->safe_roi_hold_ms = std::clamp(tf->safe_roi_hold_ms, 0, 2000);
+	tf->cluster_inertia_ms = std::clamp(tf->cluster_inertia_ms, 0, 2000);
 	tf->previewGroupClusters = obs_data_get_bool(settings, "preview_group_clusters");
 	tf->previewGroupClusterLabel = obs_data_get_bool(settings, "preview_group_cluster_label");
 
@@ -783,16 +805,6 @@ void detect_filter_update(void *data, obs_data_t *settings)
 
 	tf->x_deadband = (float)obs_data_get_double(settings, "x_deadband");
 	tf->x_deadband = std::clamp(tf->x_deadband, 0.0f, 5.0f);
-
-	tf->full_base_coverage = (float)obs_data_get_double(settings, "full_base_coverage");
-	tf->full_base_coverage = std::clamp(tf->full_base_coverage, 0.70f, 1.0f);
-	tf->full_edge_coverage = (float)obs_data_get_double(settings, "full_edge_coverage");
-	tf->full_edge_coverage = std::clamp(tf->full_edge_coverage, 0.60f, tf->full_base_coverage);
-	tf->full_edge_start = (float)obs_data_get_double(settings, "full_edge_start");
-	tf->full_edge_start = std::clamp(tf->full_edge_start, 0.0f, 0.49f);
-	tf->full_follow_speed = (float)obs_data_get_double(settings, "full_follow_speed");
-	tf->full_follow_speed = std::clamp(tf->full_follow_speed, 0.0f, 1.0f);
-
 	tf->has_last_target_zx = false; // reset safe when settings change
 
 
@@ -1182,13 +1194,12 @@ static std::vector<GroupCluster> buildGroupClusters(const std::vector<Object> &o
 		}
 	}
 
-	// Prefer biggest cluster first (useful for selecting boundingBox)
+	// Prefer biggest cluster first (useful for selecting boundingBox / consistent labels)
+// Basket-friendly ordering: first by people count (desc), then by area (desc).
 	std::sort(clusters.begin(), clusters.end(), [](const GroupCluster &a, const GroupCluster &b) {
-		const float aa = a.box.area();
-		const float bb = b.box.area();
-		if (aa != bb)
-			return aa > bb;
-		return a.count > b.count;
+		if (a.count != b.count)
+			return a.count > b.count;
+		return a.box.area() > b.box.area();
 	});
 
 	return clusters;
@@ -1251,12 +1262,12 @@ static bool selectBestGroupCluster(const std::vector<Object> &objects,
 
 		if (count >= std::max(1, minPeople)) {
 			const float area = box.area();
-			if (!found || area > bestArea || (area == bestArea && count > bestOut.count)) {
-				bestOut.box = box;
-				bestOut.count = count;
-				bestArea = area;
-				found = true;
-			}
+			if (!found || count > bestOut.count || (count == bestOut.count && area > bestArea)) {
+			bestOut.box = box;
+			bestOut.count = count;
+			bestArea = area;
+			found = true;
+		}
 			// EARLY-EXIT (crop): if this cluster contains everyone visible, it's maximal by count.
 			if (count == (int)visibleIdx.size()) {
 				return true;
@@ -1485,6 +1496,54 @@ if (tf->sortTracking) {
 			// draw the crop rectangle on the frame in a dashed line
 			drawDashedRectangle(frame, cropRect, cv::Scalar(0, 255, 0), 5, 8, 15);
 		}
+// Safe ROI (decision region) overlay + current decision bbox
+if (tf->preview && tf->trackingEnabled && tf->trackingFilter) {
+	const RectI safe = make_safe_roi(frame.cols, frame.rows,
+				 tf->safe_roi_left, tf->safe_roi_right,
+				 tf->safe_roi_top, tf->safe_roi_bottom);
+	cv::Rect safeRect(safe.x, safe.y, safe.w, safe.h);
+	drawDashedRectangle(frame, safeRect, cv::Scalar(255, 255, 0), 3, 6, 10); // yellow
+
+	// BBox currently driving crop decision (safe / hold / fallback)
+	if (rect_valid(tf->safe_roi_decision_bbox)) {
+		cv::Rect decisionRect((int)tf->safe_roi_decision_bbox.x, (int)tf->safe_roi_decision_bbox.y,
+				     (int)tf->safe_roi_decision_bbox.width, (int)tf->safe_roi_decision_bbox.height);
+		cv::Scalar col = tf->safe_roi_decision_from_safe ? cv::Scalar(255, 0, 255) : cv::Scalar(0, 165, 255); // magenta vs orange
+		if (tf->safe_roi_decision_is_hold)
+			col = cv::Scalar(255, 255, 0); // yellow for HOLD
+		drawDashedRectangle(frame, decisionRect, col, 3, 6, 10);
+		const char *lbl = tf->safe_roi_decision_is_hold ? "DECISION (HOLD)" :
+				 (tf->safe_roi_decision_from_safe ? "DECISION (SAFE)" : "DECISION (FALLBACK)");
+		cv::putText(frame, lbl,
+			    cv::Point(decisionRect.x + 6, std::max(20, decisionRect.y - 8)),
+			    cv::FONT_HERSHEY_SIMPLEX, 0.7, col, 2);
+	}
+
+	// Cluster inertia overlay (only meaningful in group mode)
+	if (tf->zoomObject == "group") {
+		if (tf->cluster_active_valid && rect_valid(tf->cluster_active_box)) {
+			cv::Rect activeRect((int)tf->cluster_active_box.x, (int)tf->cluster_active_box.y,
+					    (int)tf->cluster_active_box.width, (int)tf->cluster_active_box.height);
+			drawDashedRectangle(frame, activeRect, cv::Scalar(0, 255, 0), 2, 6, 10); // green
+			cv::putText(frame, "CLUSTER ACTIVE",
+				    cv::Point(activeRect.x + 6, std::max(20, activeRect.y - 8)),
+				    cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
+		}
+		if (tf->cluster_pending_since_ns != 0 && rect_valid(tf->cluster_pending_box)) {
+			cv::Rect pendingRect((int)tf->cluster_pending_box.x, (int)tf->cluster_pending_box.y,
+					     (int)tf->cluster_pending_box.width, (int)tf->cluster_pending_box.height);
+			drawDashedRectangle(frame, pendingRect, cv::Scalar(255, 0, 0), 2, 3, 6); // blue/red-ish
+			cv::putText(frame, "CLUSTER PENDING",
+				    cv::Point(pendingRect.x + 6, std::max(20, pendingRect.y - 8)),
+				    cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 0, 0), 2);
+		}
+	}
+
+	if (tf->safe_roi_holding) {
+		cv::putText(frame, "SAFE ROI HOLD", cv::Point(20, 40), cv::FONT_HERSHEY_SIMPLEX,
+			    1.0, cv::Scalar(255, 255, 0), 2);
+	}
+}
 		if (tf->preview && objects.size() > 0) {
 			draw_objects(frame, objects, tf->classNames);
 		}
@@ -1499,7 +1558,7 @@ if (tf->sortTracking) {
 			int minPeople = std::max(1, tf->groupMinPeople);
 			if (!tf->groupMinPeopleStrict && visibleCount > 0)
 				minPeople = std::min(minPeople, visibleCount);
-			const float maxDist = static_cast<float>(frame.cols) * 0.15f;
+			const float maxDist = static_cast<float>(frame.cols) * tf->groupMaxDistFrac;
 			if (tf->previewGroupClusters)
 				drawGroupClusters(frame, objects, minPeople, maxDist, tf->previewGroupClusterLabel);
 		}
@@ -1529,122 +1588,219 @@ if (tf->sortTracking) {
 		const int height = imageBGRA.rows;
 
 		cv::Rect2f boundingBox = cv::Rect2f(0, 0, (float)width, (float)height);
-		// get location of the objects
-		//MOD x Basket
-                if (tf->zoomObject == "single") {
+		// Safe ROI (decision region): affects ONLY crop decision, not inference
+		const RectI safe = make_safe_roi(width, height,
+						 tf->safe_roi_left, tf->safe_roi_right,
+						 tf->safe_roi_top, tf->safe_roi_bottom);
 
-        for (const Object &obj : objects) {
-        if (obj.unseenFrames == 0) {
-            boundingBox = obj.rect;
-            break;
-                }
-                }
-
-                } else if (tf->zoomObject == "group") {
-
-		cv::Rect2f groupBox;
-
-		// Distanza massima tra persone (in px): frazione della larghezza, resta scalabile con la risoluzione
-		const float maxDist = static_cast<float>(width) * 0.15f; // tarabile (basket)
-
-		// Conta solo oggetti "visibili" (unseenFrames == 0)
-		int visibleCount = 0;
-		for (const Object &obj : objects) {
-			if (obj.unseenFrames == 0)
-				visibleCount++;
-		}
-
-		// Minimo persone per considerare un "gruppo".
-		int minPeople = std::max(1, tf->groupMinPeople);
-		if (!tf->groupMinPeopleStrict && visibleCount > 0)
-			minPeople = std::min(minPeople, visibleCount);
-
-		// ---- CPU OPT: throttle group clustering for crop (no need every frame) ----
-		const uint64_t nowNs = os_gettime_ns();
-		const uint64_t throttleNs = 100000000ULL; // 100 ms
-
-		if (tf->lastGroupBoxValid && (nowNs - tf->lastGroupBoxTsNs) < throttleNs) {
-			// Reuse cached bbox for crop
-			boundingBox = tf->lastGroupBox;
-		} else if (visibleCount > 0) {
-
-			GroupCluster best;
-			if (selectBestGroupCluster(objects, minPeople, maxDist, best)) {
-				boundingBox = best.box;
-
-				// cache for next frames
-				tf->lastGroupBox = best.box;
-				tf->lastGroupCount = best.count;
-				tf->lastGroupBoxValid = true;
-				tf->lastGroupBoxTsNs = nowNs;
-			} else {
-				// fallback: unione di tutti gli oggetti visibili (così non resta full-frame)
-				bool first = true;
-				for (const Object &obj : objects) {
-					if (obj.unseenFrames > 0)
-						continue;
-					if (first) {
-						groupBox = obj.rect;
-						first = false;
-					} else {
-						groupBox |= obj.rect;
-					}
-				}
-				if (!first) {
-					boundingBox = groupBox;
-
-					// cache fallback too
-					tf->lastGroupBox = groupBox;
-					tf->lastGroupCount = visibleCount;
-					tf->lastGroupBoxValid = true;
-					tf->lastGroupBoxTsNs = nowNs;
-				} else {
-					tf->lastGroupBoxValid = false;
-				}
-			}
-		} else {
-			tf->lastGroupBoxValid = false;
-		}
-
-	} else if (tf->zoomObject == "biggest") {
-
-		float maxArea = 0;
+		std::vector<Object> safeObjects;
+		safeObjects.reserve(objects.size());
 		for (const Object &obj : objects) {
 			if (obj.unseenFrames > 0)
 				continue;
-			float area = obj.rect.area();
-			if (area > maxArea) {
-            maxArea = area;
-            boundingBox = obj.rect;
-                }
-        }
-
-                } else if (tf->zoomObject == "oldest") {
-
-        uint64_t oldestId = UINT64_MAX;
-        for (const Object &obj : objects) {
-        if (obj.unseenFrames == 0 && obj.id < oldestId) {
-            oldestId = obj.id;
-            boundingBox = obj.rect;
-                }
-        }
-
-                } else {
-
-		if (!objects.empty()) {
-			bool init = false;
-			for (const Object &obj : objects) {
-				if (obj.unseenFrames > 0)
-					continue;
-				if (!init) {
-					boundingBox = obj.rect;
-					init = true;
-				} else {
-					boundingBox |= obj.rect;
-				}
-			}
-			// If everything is unseen, keep full frame as fallback
+			if (!obj_center_in_safe(obj, safe))
+				continue;
+			safeObjects.push_back(obj);
 		}
+
+		auto compute_bbox_from_vec = [&](const std::vector<Object> &objs, bool allowCache, cv::Rect2f &outBox) -> bool {
+			outBox = cv::Rect2f(0, 0, (float)width, (float)height);
+
+			// Count visible (objs here are already visible)
+			const int visibleCount = (int)objs.size();
+
+			if (tf->zoomObject == "single") {
+				if (visibleCount > 0) {
+					outBox = objs.front().rect;
+					return true;
+				}
+				return false;
+
+			} else if (tf->zoomObject == "group") {
+
+				cv::Rect2f groupBox;
+				const float maxDist = static_cast<float>(width) * tf->groupMaxDistFrac; // configurable
+
+				int minPeople = std::max(1, tf->groupMinPeople);
+				if (!tf->groupMinPeopleStrict && visibleCount > 0)
+					minPeople = std::min(minPeople, visibleCount);
+
+				const uint64_t nowNs = os_gettime_ns();
+				const uint64_t throttleNs = 100000000ULL; // 100 ms
+
+				if (allowCache && tf->lastGroupBoxValid && (nowNs - tf->lastGroupBoxTsNs) < throttleNs) {
+					outBox = tf->lastGroupBox;
+					return true;
+				}
+
+				if (visibleCount > 0) {
+					GroupCluster best;
+					if (selectBestGroupCluster(objs, minPeople, maxDist, best)) {
+
+						// Cluster temporal inertia: avoid micro-switching between clusters
+						// Sport veloce default: 150ms
+						const float switchDistPx = std::max(20.0f, 0.03f * (float)width); // ~3% of width
+						tf->cluster_inertia_pending = false;
+
+						if (!tf->cluster_active_valid) {
+							tf->cluster_active_box = best.box;
+							tf->cluster_active_valid = true;
+							tf->cluster_pending_since_ns = 0;
+							tf->cluster_pending_box = cv::Rect2f(0, 0, 0, 0);
+						} else {
+							const float d = rect_center_dist(best.box, tf->cluster_active_box);
+							if (d <= switchDistPx) {
+								// same (or very close) cluster: update immediately
+								tf->cluster_active_box = best.box;
+								tf->cluster_pending_since_ns = 0;
+								tf->cluster_pending_box = cv::Rect2f(0, 0, 0, 0);
+							} else {
+								// different cluster: wait inertia before switching
+								if (tf->cluster_inertia_ms <= 0) {
+									tf->cluster_active_box = best.box;
+									tf->cluster_pending_since_ns = 0;
+									tf->cluster_pending_box = cv::Rect2f(0, 0, 0, 0);
+								} else {
+									if (tf->cluster_pending_since_ns == 0) {
+										tf->cluster_pending_since_ns = nowNs;
+										tf->cluster_pending_box = best.box;
+									} else {
+										const uint64_t elapsedMs = (nowNs - tf->cluster_pending_since_ns) / 1000000ULL;
+
+										// if pending target "jumps" during waiting, restart pending (avoid flip-flop)
+										const float dp = rect_center_dist(tf->cluster_pending_box, best.box);
+										if (dp > switchDistPx) {
+											tf->cluster_pending_since_ns = nowNs;
+											tf->cluster_pending_box = best.box;
+										} else if ((int)elapsedMs >= tf->cluster_inertia_ms) {
+											tf->cluster_active_box = tf->cluster_pending_box;
+											tf->cluster_pending_since_ns = 0;
+											tf->cluster_pending_box = cv::Rect2f(0, 0, 0, 0);
+										} else {
+											tf->cluster_inertia_pending = true;
+										}
+									}
+								}
+							}
+						}
+						outBox = tf->cluster_active_box;
+
+						if (allowCache) {
+							tf->lastGroupBox = best.box;
+							tf->lastGroupCount = best.count;
+							tf->lastGroupBoxValid = true;
+							tf->lastGroupBoxTsNs = nowNs;
+						}
+						return true;
+					} else {
+						// fallback: union of all visible objects
+						bool first = true;
+						for (const Object &obj : objs) {
+							if (first) {
+								groupBox = obj.rect;
+								first = false;
+							} else {
+								groupBox |= obj.rect;
+							}
+						}
+						if (!first) {
+							outBox = groupBox;
+
+							if (allowCache) {
+								tf->lastGroupBox = groupBox;
+								tf->lastGroupCount = visibleCount;
+								tf->lastGroupBoxValid = true;
+								tf->lastGroupBoxTsNs = nowNs;
+							}
+							return true;
+						}
+					}
+				}
+
+				if (allowCache)
+					tf->lastGroupBoxValid = false;
+
+				return false;
+
+			} else if (tf->zoomObject == "biggest") {
+
+				float maxArea = 0.0f;
+				bool found = false;
+				for (const Object &obj : objs) {
+					float area = obj.rect.area();
+					if (area > maxArea) {
+						maxArea = area;
+						outBox = obj.rect;
+						found = true;
+					}
+				}
+				return found;
+
+			} else if (tf->zoomObject == "oldest") {
+
+				uint64_t oldestId = UINT64_MAX;
+				bool found = false;
+				for (const Object &obj : objs) {
+					if (obj.id < oldestId) {
+						oldestId = obj.id;
+						outBox = obj.rect;
+						found = true;
+					}
+				}
+				return found;
+
+			} else { // all
+
+				if (!objs.empty()) {
+					outBox = objs.front().rect;
+					for (size_t i = 1; i < objs.size(); ++i)
+						outBox |= objs[i].rect;
+					return true;
+				}
+				return false;
+			}
+		};
+
+		const uint64_t nowNs = os_gettime_ns();
+
+		// 1) Try SAFE decision set
+		cv::Rect2f safeBox;
+		const bool safeOk = (!safeObjects.empty()) && compute_bbox_from_vec(safeObjects, false, safeBox) && rect_valid(safeBox);
+
+		if (safeOk) {
+			boundingBox = safeBox;
+			tf->safe_roi_last_good_bbox = safeBox;
+			tf->safe_roi_decision_bbox = safeBox;
+			tf->safe_roi_decision_from_safe = true;
+			tf->safe_roi_decision_is_hold = false;
+			tf->safe_roi_hold_until_ns = nowNs + (uint64_t)tf->safe_roi_hold_ms * 1000000ULL;
+			tf->safe_roi_holding = false;
+		} else if (rect_valid(tf->safe_roi_last_good_bbox) && nowNs < tf->safe_roi_hold_until_ns) {
+			// 2) HOLD last safe bbox briefly
+			boundingBox = tf->safe_roi_last_good_bbox;
+			tf->safe_roi_holding = true;
+			tf->safe_roi_decision_bbox = tf->safe_roi_last_good_bbox;
+			tf->safe_roi_decision_from_safe = true;
+			tf->safe_roi_decision_is_hold = true;
+		} else {
+			// 3) FALLBACK: compute from full visible set (existing behavior)
+			std::vector<Object> visible;
+			visible.reserve(objects.size());
+			for (const Object &obj : objects) {
+				if (obj.unseenFrames == 0)
+					visible.push_back(obj);
+			}
+
+			cv::Rect2f fullBox;
+			const bool fullOk = (!visible.empty()) && compute_bbox_from_vec(visible, true, fullBox) && rect_valid(fullBox);
+			if (fullOk)
+				boundingBox = fullBox;
+			// debug decision
+			tf->safe_roi_decision_bbox = fullOk ? fullBox : cv::Rect2f(0,0,0,0);
+			tf->safe_roi_decision_from_safe = false;
+			tf->safe_roi_decision_is_hold = false;
+
+			tf->safe_roi_holding = false;
 		}
 
 		bool lostTracking = true;
@@ -1665,64 +1821,7 @@ float frameAspectRatio = (float)width / (float)height;
 
 float zx = 0.0f, zy = 0.0f, zw = 0.0f, zh = 0.0f;
 
-// CAM-180° FULL: conservative follow (X+Y) + edge-only zoom (wide at center, slight zoom near edges)
-if (tf->camera_mode == "cam180_full") {
-	// If we have no valid target, fall back to centered wide view.
-	float targetCenterX = (float)width * 0.5f;
-	float targetCenterY = (float)height * 0.5f;
-	if (!lostTracking) {
-		targetCenterX = boundingBox.x + (boundingBox.width * 0.5f);
-		targetCenterY = boundingBox.y + (boundingBox.height * 0.5f);
-	}
-
-	// Edge-only zoom is driven by horizontal distance from the center of the 180° frame.
-	const float nx = (width > 0) ? (targetCenterX / (float)width) : 0.5f;
-	const float d = std::fabs(nx - 0.5f); // 0 center, 0.5 edges
-
-	float edgeStart = tf->full_edge_start;
-	edgeStart = std::clamp(edgeStart, 0.0f, 0.49f);
-
-	float e = 0.0f;
-	if (d > edgeStart && (0.5f - edgeStart) > 1e-6f)
-		e = (d - edgeStart) / (0.5f - edgeStart);
-
-	e = std::clamp(e, 0.0f, 1.0f);
-	// Smoothstep (so it doesn't "kick" when crossing edgeStart)
-	const float e2 = e * e * (3.0f - 2.0f * e);
-
-	float baseCoverage = tf->full_base_coverage;
-	baseCoverage = std::clamp(baseCoverage, 0.70f, 1.0f);
-	float edgeCoverage = tf->full_edge_coverage;
-	edgeCoverage = std::clamp(edgeCoverage, 0.60f, baseCoverage);
-
-	// Wide at center (baseCoverage), zoom in slightly near edges (edgeCoverage).
-	const float coverage = baseCoverage - (baseCoverage - edgeCoverage) * e2;
-
-	zw = (float)width * coverage;
-	if (zw < 1.0f) zw = 1.0f;
-
-	// Keep 16:9 output crop.
-	const float outAspect = 16.0f / 9.0f;
-	zh = zw / outAspect;
-
-	// Safety: if height is too small for that width, clamp by height.
-	if (zh > (float)height) {
-		zh = (float)height;
-		zw = zh * outAspect;
-	}
-
-	// Center crop on target (follow X+Y), then clamp in-frame.
-	zx = targetCenterX - (zw * 0.5f);
-	zy = targetCenterY - (zh * 0.5f);
-
-	const float maxZX = (float)width - zw;
-	const float maxZY = (float)height - zh;
-	zx = std::clamp(zx, 0.0f, (maxZX < 0.0f) ? 0.0f : maxZX);
-	zy = std::clamp(zy, 0.0f, (maxZY < 0.0f) ? 0.0f : maxZY);
-
-	// Reset deadband memory so switching modes doesn't stick
-	tf->has_last_target_zx = false;
-} else if (tf->zoomObject == "group") {
+if (tf->zoomObject == "group") {
         // Pan-only on X: keep full height (no vertical crop) and keep a fixed window width.
         // Reuse zoomFactor as "horizontal coverage" (0..1], where 1 means full width.
         float coverage = tf->zoomFactor;
@@ -1751,9 +1850,6 @@ if (tf->camera_mode == "cam180_full") {
                 float targetCenterX = boundingBox.x + (boundingBox.width * 0.5f);
                 float norm = (width > 0) ? (targetCenterX / (float)width) : 0.5f;
                 float h = tf->x_snap_hysteresis;
-                // Make hysteresis relative to the output crop width (zw)
-                if (width > 0 && zw > 0)
-                        h = h * (zw / (float)width);
                 if (h < 0.0f) h = 0.0f;
                 if (h > 0.20f) h = 0.20f;
                 const float t1 = 1.0f / 3.0f;
@@ -1811,7 +1907,7 @@ if (tf->camera_mode == "cam180_full") {
 }
 				// --- Optional X deadband (applies to ALL zoom_object modes) ---
 			if (tf->x_deadband > 0.0f) {
-				const float db_px = (tf->x_deadband / 100.0f) * zw; // relative to output crop width
+				const float db_px = (tf->x_deadband / 100.0f) * (float)width;
 
 				if (tf->has_last_target_zx) {
 				const float dx = zx - tf->last_target_zx;
@@ -1831,8 +1927,7 @@ if (tf->camera_mode == "cam180_full") {
 				tf->trackVelX = tf->trackVelY = tf->trackVelW = tf->trackVelH = 0.0f;
                 } else {
                         // interpolate the zooming box to tf->trackingRect (frame-rate independent, low hysteresis)
-                        const float baseAlpha60 = (tf->camera_mode == "cam180_full") ? tf->full_follow_speed : tf->zoomSpeedFactor;
-						const float alpha60 = baseAlpha60 * (lostTracking ? 0.2f : 1.0f);
+                        const float alpha60 = tf->zoomSpeedFactor * (lostTracking ? 0.2f : 1.0f);
 
                         if (alpha60 <= 0.0f) {
                         	// frozen

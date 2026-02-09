@@ -1,106 +1,34 @@
-# ⚠️ Stalled ⚠️ This project is not under active development
+# OBS-Detect Vision – Basket Edition (Safe ROI) – v5.0.1
 
-## OBS Detect - Object Detection and Masking Filter
+This bundle contains the **updated `detect-filter.cpp`** for the *Safe ROI + Group clustering* workflow.
 
-<div align="center">
+> Note: this ZIP is a **source patch bundle** (it does not include the full repository tree).  
+> Drop `src/detect-filter.cpp` into your repo (OpenVINO branch / Windows build) replacing the existing file.
 
-[![GitHub](https://img.shields.io/github/license/occ-ai/obs-detect)](https://github.com/occ-ai/obs-detect/blob/main/LICENSE)
-[![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/occ-ai/obs-detect/push.yaml)](https://github.com/occ-ai/obs-detect/actions/workflows/push.yaml)
-[![Total downloads](https://img.shields.io/github/downloads/occ-ai/obs-detect/total)](https://github.com/occ-ai/obs-detect/releases)
-[![GitHub release (latest by date)](https://img.shields.io/github/v/release/occ-ai/obs-detect)](https://github.com/occ-ai/obs-detect/releases)
-[![Discord](https://img.shields.io/discord/1200229425141252116)](https://discord.gg/KbjGU2vvUz)
+## What changed in v5.0.1
 
-</div>
+- **Preview group clusters now uses `groupMaxDistFrac`** (same value as the crop logic).
+- **Removed duplicated Safe ROI defaults** in `detect_filter_defaults()`.
+- **Auto-snap velocity reset cleanup** (removed redundant resets).
+- **Clustering allocation/perf tweaks** (reused buffers; less per-frame churn).
+- **Better cluster selection for basketball:** choose **highest people count first**, then **largest area**.
 
-A plugin for [OBS Studio](https://obsproject.com/) that allows you to detect many types of objects in any source, track them and apply masking.
+## Settings recap (Tracking group)
 
-If you like this work, which is given to you completely free of charge, please consider supporting it by sponsoring us on GitHub:
+- `GroupMaxDistFrac` (0.05–0.50): max distance between people as a fraction of frame width.
+- `Group min people` + `Strict min people`
+- Safe ROI margins: Left/Right/Top/Bottom (%)
+- `Safe ROI Hold (ms)`
+- `Cluster inertia (ms)`
+- `Preview group cluster` + optional label
 
-- https://github.com/sponsors/royshil
-- https://github.com/sponsors/umireon
+## How to tag the release in Git
 
-This work uses the great contributions from [EdgeYOLO-ROS](https://github.com/fateshelled/EdgeYOLO-ROS) and [PINTO-Model-Zoo](https://github.com/PINTO0309/PINTO_model_zoo). The Hungarian algorithm is taken from https://github.com/Gluttton/munkres-cpp under the GPLv2 license.
+From the repo root:
 
-## Usage
-
-<div align="center">
-<a href="https://youtu.be/LrbUrvaGreQ"><img width="40%" src="https://github.com/occ-ai/obs-detect/assets/441170/b8e7367e-c1b0-4c7e-b0df-af45ead87199" /></a>&nbsp;
-<a href="https://youtu.be/zmdq1bPVYs0"><img width="40%" src="https://github.com/occ-ai/obs-detect/assets/441170/2eb08589-1695-4a40-877e-4985c2b5270f" /></a>
-</div>
-
-- Add the "Detect" filter to any source with an image (Media, Browser, VLC, Image, etc.)
-- Enable "Masking" or "Tracking"
-
-Use Detect to track your pet, or blur out people in your video!
-
-More information and usage tutorials to follow soon.
-
-## Features
-
-Current features:
-
-- Detect over 80 categories of objects, using an efficient model ([EdgeYOLO](https://github.com/LSH9832/edgeyolo))
-- 3 Model sizes: Small, Medium and Large
-- Face detection model, fast and efficient ([YuNet](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet))
-- Load custom ONNX detection models from disk
-- Filter by: Minimal Detection confidence, Object category (e.g. only "Person"), Object Minimal Size
-- Masking: Blur, Pixelate, Solid color, Transparent, output binary mask (combine with other plugins!)
-- Tracking: Single object / Biggest / Oldest / All objects, Zoom factor, smooth transition
-- SORT algorithm for tracking smoothness and continuity
-- Save detections to file in real-time, for integrations e.g. with Streamer.bot
-
-Roadmap features:
-- Precise object mask, beyond bounding box
-- Multiple object category selection (e.g. Dog + Cat + Duck)
-- Make available detection information for other plugins through settings
-
-## Train and use a custom detection model
-
-Follow the instructions in [docs/train_model.md](docs/train_model.md) to train and use your own custom model.
-
-## Building
-
-The plugin was built and tested on Mac OSX  (Intel & Apple silicon), Windows and Linux.
-
-Start by cloning this repo to a directory of your choice.
-
-### Mac OSX
-
-Using the CI pipeline scripts, locally you would just call the zsh script. By default this builds a universal binary for both Intel and Apple Silicon. To build for a specific architecture please see `.github/scripts/.build.zsh` for the `-arch` options.
-
-```sh
-$ ./.github/scripts/build-macos -c Release
+```bash
+git add src/detect-filter.cpp README.md CHANGELOG.md
+git commit -m "v5.0.1: Safe ROI + group clustering refinements"
+git tag -a v5.0.1 -m "OBS-Detect Vision Basket Edition v5.0.1"
+git push origin main --tags
 ```
-
-#### Install
-The above script should succeed and the plugin files (e.g. `obs-ocr.plugin`) will reside in the `./release/Release` folder off of the root. Copy the `.plugin` file to the OBS directory e.g. `~/Library/Application Support/obs-studio/plugins`.
-
-To get `.pkg` installer file, run for example
-```sh
-$ ./.github/scripts/package-macos -c Release
-```
-(Note that maybe the outputs will be in the `Release` folder and not the `install` folder like `pakage-macos` expects, so you will need to rename the folder from `build_x86_64/Release` to `build_x86_64/install`)
-
-### Linux (Ubuntu)
-
-Use the CI scripts again
-```sh
-$ ./.github/scripts/build-linux.sh
-```
-
-Copy the results to the standard OBS folders on Ubuntu
-```sh
-$ sudo cp -R release/RelWithDebInfo/lib/* /usr/lib/x86_64-linux-gnu/
-$ sudo cp -R release/RelWithDebInfo/share/* /usr/share/
-```
-Note: The official [OBS plugins guide](https://obsproject.com/kb/plugins-guide) recommends adding plugins to the `~/.config/obs-studio/plugins` folder.
-
-### Windows
-
-Use the CI scripts again, for example:
-
-```powershell
-> .github/scripts/Build-Windows.ps1 -Target x64
-```
-
-The build should exist in the `./release` folder off the root. You can manually install the files in the OBS directory.
