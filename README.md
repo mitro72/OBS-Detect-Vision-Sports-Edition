@@ -1,4 +1,4 @@
-# OBS-Detect Vision – Basket Edition (Safe ROI) – v5.0.1
+# OBS-Detect Vision – Sports Edition (Safe ROI) – v5.0.1
 
 This bundle contains the **updated `detect-filter.cpp`** for the *Safe ROI + Group clustering* workflow.
 
