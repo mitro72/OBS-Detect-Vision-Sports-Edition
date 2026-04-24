@@ -18,6 +18,7 @@
 #include <mutex>
 #include <regex>
 #include <thread>
+#include <cstdio>
 
 #include <nlohmann/json.hpp>
 
@@ -138,6 +139,19 @@ struct detect_filter : public filter_data {
 	float groupMaxDistFrac = 0.15f; // max distance between people (fraction of frame width)
 	bool previewGroupClusters = false;
 	bool previewGroupClusterLabel = false;
+
+	// Group-only edge zoom: extra 2D zoom applied only when a real group cluster is selected.
+	// This is NOT the 32:9 -> 16:9 pan window; it scales that window on both X and Y.
+	bool groupEdgeZoomEnabled = false;
+	float groupEdgeZoomAmount = 1.0f;  // max real 2D zoom multiplier at the sides: 1.0 = no extra zoom, 4.0 = 4x
+	float groupEdgeZoomCurve = 2.0f;   // higher = flatter center, stronger only near edges
+	float groupEdgeZoomSmooth = 0.60f; // seconds
+	float groupEdgeZoomValue = 1.0f;  // smoothed real 2D zoom multiplier
+	float groupEdgeZoomVel = 0.0f;
+	bool lastGroupBoxIsTrueCluster = false;
+
+	// Scale filter used after Crop/Pad to make real 2D zoom fill the base 16:9 window.
+	obs_source_t *trackingScaleFilter = nullptr;
 
 	// Safe ROI (decision region) margins in percent (used only for crop decision, not inference)
 	int safe_roi_left = 10;
@@ -401,7 +415,7 @@ obs_properties_t *detect_filter_properties(void *data)
 		// Show/hide the core tracking controls when the group is enabled/disabled
 		for (auto prop_name : {"zoom_factor", "zoom_object", "zoom_speed_factor", "x_pan_preset",
 				       "x_snap_hysteresis", "x_snap_transition_time", "x_deadband", "infer_interval_ms", "infer_scale",
-				       "group_min_people", "group_min_people_strict", "safe_roi_left", "safe_roi_right", "safe_roi_top", "safe_roi_bottom", "safe_roi_hold_ms", "cluster_inertia_ms"}) {
+				       "group_min_people", "group_min_people_strict", "group_edge_zoom_enabled", "group_edge_zoom_amount", "group_edge_zoom_curve", "group_edge_zoom_smooth", "safe_roi_left", "safe_roi_right", "safe_roi_top", "safe_roi_bottom", "safe_roi_hold_ms", "cluster_inertia_ms"}) {
 			obs_property_t *prop = obs_properties_get(props_, prop_name);
 			if (prop)
 				obs_property_set_visible(prop, enabled);
@@ -423,6 +437,15 @@ obs_properties_t *detect_filter_properties(void *data)
 		if (gmd)
 			obs_property_set_visible(gmd, enabled && is_group);
 
+		const bool edge_on = obs_data_get_bool(settings, "group_edge_zoom_enabled");
+		obs_property_t *gez = obs_properties_get(props_, "group_edge_zoom_enabled");
+		if (gez)
+			obs_property_set_visible(gez, enabled && is_group);
+		for (const char *edge_prop_name : {"group_edge_zoom_amount", "group_edge_zoom_curve", "group_edge_zoom_smooth"}) {
+			obs_property_t *ep = obs_properties_get(props_, edge_prop_name);
+			if (ep)
+				obs_property_set_visible(ep, enabled && is_group && edge_on);
+		}
 
 		obs_property_t *pgc = obs_properties_get(props_, "preview_group_clusters");
 		if (pgc)
@@ -497,11 +520,46 @@ obs_property_set_modified_callback(zoom_object, [](obs_properties_t *props_, obs
 			const bool on = obs_data_get_bool(settings, "preview_group_clusters");
 			obs_property_set_visible(lbl, enabled && is_group && on);
 		}
+
+		const bool edge_on = obs_data_get_bool(settings, "group_edge_zoom_enabled");
+		obs_property_t *gez = obs_properties_get(props_, "group_edge_zoom_enabled");
+		if (gez)
+			obs_property_set_visible(gez, enabled && is_group);
+		for (const char *edge_prop_name : {"group_edge_zoom_amount", "group_edge_zoom_curve", "group_edge_zoom_smooth"}) {
+			obs_property_t *ep = obs_properties_get(props_, edge_prop_name);
+			if (ep)
+				obs_property_set_visible(ep, enabled && is_group && edge_on);
+		}
 		return true;
 	});
 
 	obs_properties_add_int(tracking_group_props, "group_min_people", "Group min people", 1, 15, 1);
 obs_properties_add_float_slider(tracking_group_props, "group_max_dist_frac", obs_module_text("GroupMaxDistFrac"), 0.05, 0.50, 0.01);
+
+	obs_property_t *group_edge_zoom_enabled =
+		obs_properties_add_bool(tracking_group_props, "group_edge_zoom_enabled", "Group edge zoom 2D (U curve)");
+	obs_properties_add_float_slider(tracking_group_props, "group_edge_zoom_amount",
+					"Group edge zoom max (x)", 1.00, 4.00, 0.05);
+	obs_properties_add_float_slider(tracking_group_props, "group_edge_zoom_curve",
+					"Group edge zoom curve", 1.0, 5.0, 0.10);
+	obs_properties_add_float_slider(tracking_group_props, "group_edge_zoom_smooth",
+					"Group edge zoom smooth (s)", 0.05, 2.00, 0.05);
+	obs_property_set_modified_callback(group_edge_zoom_enabled, [](obs_properties_t *props_, obs_property_t *, obs_data_t *settings) {
+		const bool enabled = obs_data_get_bool(settings, "tracking_group");
+		const char *zo = obs_data_get_string(settings, "zoom_object");
+		const bool is_group = (zo && strcmp(zo, "group") == 0);
+		const bool edge_on = obs_data_get_bool(settings, "group_edge_zoom_enabled");
+		for (const char *edge_prop_name : {"group_edge_zoom_amount", "group_edge_zoom_curve", "group_edge_zoom_smooth"}) {
+			obs_property_t *ep = obs_properties_get(props_, edge_prop_name);
+			if (ep)
+				obs_property_set_visible(ep, enabled && is_group && edge_on);
+		}
+		return true;
+	});
+	obs_property_set_visible(group_edge_zoom_enabled, false);
+	obs_property_set_visible(obs_properties_get(tracking_group_props, "group_edge_zoom_amount"), false);
+	obs_property_set_visible(obs_properties_get(tracking_group_props, "group_edge_zoom_curve"), false);
+	obs_property_set_visible(obs_properties_get(tracking_group_props, "group_edge_zoom_smooth"), false);
 
 	obs_properties_add_int(tracking_group_props, "safe_roi_left", "Safe ROI Left Margin (%)", 0, 40, 1);
 	obs_properties_add_int(tracking_group_props, "safe_roi_right", "Safe ROI Right Margin (%)", 0, 40, 1);
@@ -727,6 +785,10 @@ void detect_filter_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "group_min_people", 6);
 	obs_data_set_default_bool(settings, "group_min_people_strict", false);
 	obs_data_set_default_double(settings, "group_max_dist_frac", 0.15);
+	obs_data_set_default_bool(settings, "group_edge_zoom_enabled", false);
+	obs_data_set_default_double(settings, "group_edge_zoom_amount", 1.20);
+	obs_data_set_default_double(settings, "group_edge_zoom_curve", 2.0);
+	obs_data_set_default_double(settings, "group_edge_zoom_smooth", 0.60);
 	obs_data_set_default_int(settings, "safe_roi_left", 10);
 	obs_data_set_default_int(settings, "safe_roi_right", 10);
 	obs_data_set_default_int(settings, "safe_roi_top", 0);
@@ -773,6 +835,13 @@ void detect_filter_update(void *data, obs_data_t *settings)
 	tf->groupMinPeopleStrict = obs_data_get_bool(settings, "group_min_people_strict");
 	tf->groupMaxDistFrac = (float)obs_data_get_double(settings, "group_max_dist_frac");
 	tf->groupMaxDistFrac = std::clamp(tf->groupMaxDistFrac, 0.05f, 0.50f);
+	tf->groupEdgeZoomEnabled = obs_data_get_bool(settings, "group_edge_zoom_enabled");
+	tf->groupEdgeZoomAmount = (float)obs_data_get_double(settings, "group_edge_zoom_amount");
+	tf->groupEdgeZoomCurve = (float)obs_data_get_double(settings, "group_edge_zoom_curve");
+	tf->groupEdgeZoomSmooth = (float)obs_data_get_double(settings, "group_edge_zoom_smooth");
+	tf->groupEdgeZoomAmount = std::clamp(tf->groupEdgeZoomAmount, 1.0f, 4.0f);
+	tf->groupEdgeZoomCurve = std::clamp(tf->groupEdgeZoomCurve, 1.0f, 5.0f);
+	tf->groupEdgeZoomSmooth = std::clamp(tf->groupEdgeZoomSmooth, 0.05f, 2.00f);
 
 	tf->safe_roi_left = (int)obs_data_get_int(settings, "safe_roi_left");
 	tf->safe_roi_right = (int)obs_data_get_int(settings, "safe_roi_right");
@@ -841,6 +910,7 @@ void detect_filter_update(void *data, obs_data_t *settings)
 		}
 		if (tf->trackingEnabled) {
 			obs_log(LOG_DEBUG, "Tracking enabled");
+
 			obs_source_t *crop_pad_filter =
 				obs_source_get_filter_by_name(parent, "Detect Tracking");
 			if (!crop_pad_filter) {
@@ -849,8 +919,35 @@ void detect_filter_update(void *data, obs_data_t *settings)
 				obs_source_filter_add(parent, crop_pad_filter);
 			}
 			tf->trackingFilter = crop_pad_filter;
+
+			// Real 2D zoom requires Crop/Pad + Scale.
+			// Crop/Pad alone changes the filtered source dimensions; in OBS this can look
+			// like a cut instead of a zoom. This scale filter enlarges the cropped 16:9
+			// area back to the base 16:9 output size.
+			obs_source_t *scale_filter =
+				obs_source_get_filter_by_name(parent, "Detect Tracking Scale");
+			if (!scale_filter) {
+				obs_data_t *scale_settings = obs_data_create();
+				obs_data_set_string(scale_settings, "resolution", "1920x1080");
+				scale_filter = obs_source_create(
+					"scale_filter", "Detect Tracking Scale", scale_settings, nullptr);
+				obs_data_release(scale_settings);
+				if (scale_filter)
+					obs_source_filter_add(parent, scale_filter);
+			}
+			tf->trackingScaleFilter = scale_filter;
+			if (tf->trackingScaleFilter)
+				obs_source_set_enabled(tf->trackingScaleFilter, false);
 		} else {
 			obs_log(LOG_DEBUG, "Tracking disabled");
+
+			obs_source_t *scale_filter =
+				obs_source_get_filter_by_name(parent, "Detect Tracking Scale");
+			if (scale_filter) {
+				obs_source_filter_remove(parent, scale_filter);
+			}
+			tf->trackingScaleFilter = nullptr;
+
 			obs_source_t *crop_pad_filter =
 				obs_source_get_filter_by_name(parent, "Detect Tracking");
 			if (crop_pad_filter) {
@@ -1603,7 +1700,10 @@ if (tf->preview && tf->trackingEnabled && tf->trackingFilter) {
 			safeObjects.push_back(obj);
 		}
 
-		auto compute_bbox_from_vec = [&](const std::vector<Object> &objs, bool allowCache, cv::Rect2f &outBox) -> bool {
+		bool finalGroupClusterValid = false;
+
+		auto compute_bbox_from_vec = [&](const std::vector<Object> &objs, bool allowCache, cv::Rect2f &outBox, bool &outTrueGroupCluster) -> bool {
+			outTrueGroupCluster = false;
 			outBox = cv::Rect2f(0, 0, (float)width, (float)height);
 
 			// Count visible (objs here are already visible)
@@ -1630,6 +1730,7 @@ if (tf->preview && tf->trackingEnabled && tf->trackingFilter) {
 
 				if (allowCache && tf->lastGroupBoxValid && (nowNs - tf->lastGroupBoxTsNs) < throttleNs) {
 					outBox = tf->lastGroupBox;
+					outTrueGroupCluster = tf->lastGroupBoxIsTrueCluster;
 					return true;
 				}
 
@@ -1684,11 +1785,13 @@ if (tf->preview && tf->trackingEnabled && tf->trackingFilter) {
 							}
 						}
 						outBox = tf->cluster_active_box;
+						outTrueGroupCluster = true;
 
 						if (allowCache) {
 							tf->lastGroupBox = best.box;
 							tf->lastGroupCount = best.count;
 							tf->lastGroupBoxValid = true;
+							tf->lastGroupBoxIsTrueCluster = true;
 							tf->lastGroupBoxTsNs = nowNs;
 						}
 						return true;
@@ -1710,15 +1813,19 @@ if (tf->preview && tf->trackingEnabled && tf->trackingFilter) {
 								tf->lastGroupBox = groupBox;
 								tf->lastGroupCount = visibleCount;
 								tf->lastGroupBoxValid = true;
+								tf->lastGroupBoxIsTrueCluster = false;
 								tf->lastGroupBoxTsNs = nowNs;
 							}
+							outTrueGroupCluster = false;
 							return true;
 						}
 					}
 				}
 
-				if (allowCache)
+				if (allowCache) {
 					tf->lastGroupBoxValid = false;
+					tf->lastGroupBoxIsTrueCluster = false;
+				}
 
 				return false;
 
@@ -1765,9 +1872,11 @@ if (tf->preview && tf->trackingEnabled && tf->trackingFilter) {
 
 		// 1) Try SAFE decision set
 		cv::Rect2f safeBox;
-		const bool safeOk = (!safeObjects.empty()) && compute_bbox_from_vec(safeObjects, false, safeBox) && rect_valid(safeBox);
+		bool safeTrueGroupCluster = false;
+		const bool safeOk = (!safeObjects.empty()) && compute_bbox_from_vec(safeObjects, false, safeBox, safeTrueGroupCluster) && rect_valid(safeBox);
 
 		if (safeOk) {
+			finalGroupClusterValid = safeTrueGroupCluster;
 			boundingBox = safeBox;
 			tf->safe_roi_last_good_bbox = safeBox;
 			tf->safe_roi_decision_bbox = safeBox;
@@ -1792,9 +1901,12 @@ if (tf->preview && tf->trackingEnabled && tf->trackingFilter) {
 			}
 
 			cv::Rect2f fullBox;
-			const bool fullOk = (!visible.empty()) && compute_bbox_from_vec(visible, true, fullBox) && rect_valid(fullBox);
-			if (fullOk)
+			bool fullTrueGroupCluster = false;
+			const bool fullOk = (!visible.empty()) && compute_bbox_from_vec(visible, true, fullBox, fullTrueGroupCluster) && rect_valid(fullBox);
+			if (fullOk) {
 				boundingBox = fullBox;
+				finalGroupClusterValid = fullTrueGroupCluster;
+			}
 			// debug decision
 			tf->safe_roi_decision_bbox = fullOk ? fullBox : cv::Rect2f(0,0,0,0);
 			tf->safe_roi_decision_from_safe = false;
@@ -1820,79 +1932,113 @@ if (tf->preview && tf->trackingEnabled && tf->trackingFilter) {
 float frameAspectRatio = (float)width / (float)height;
 
 float zx = 0.0f, zy = 0.0f, zw = 0.0f, zh = 0.0f;
+bool useTrackingScaleFilter = false;
+int trackingScaleOutW = 0;
+int trackingScaleOutH = 0;
 
 if (tf->zoomObject == "group") {
-        // Pan-only on X: keep full height (no vertical crop) and keep a fixed window width.
-        // Reuse zoomFactor as "horizontal coverage" (0..1], where 1 means full width.
-        float coverage = tf->zoomFactor;
-        if (coverage <= 0.0f) coverage = 1.0f;
-        if (coverage > 1.0f)  coverage = 1.0f;
+	// Group mode has TWO separate concepts:
+	// 1) zoom_factor = base 32:9 -> 16:9 pan window, normally 0.50 on a 7680x2160 source.
+	// 2) groupEdgeZoomValue = real 2D zoom multiplier, only when a true group cluster exists.
+	//
+	// IMPORTANT FIX:
+	// The extra 2D zoom must be applied INSIDE the current base 16:9 pan window.
+	// Do not use the YOLO/group bbox vertical center to position Y: player boxes are not a stable
+	// representation of the useful court area and can make OBS cut the floor/baseline.
+	// Instead, keep Y anchored to the source frame with a small downward bias, so we crop a bit
+	// more from the top than from the bottom and preserve the court base.
+	float baseCoverage = tf->zoomFactor;
+	if (baseCoverage <= 0.0f)
+		baseCoverage = 1.0f;
+	baseCoverage = std::clamp(baseCoverage, 0.05f, 1.0f);
 
-        zh = (float)height;
-        zw = (float)width * coverage;
+	const float baseZw = std::clamp((float)width * baseCoverage, 1.0f, (float)width);
+	const float baseZh = (float)height;
 
-        // Safety clamp: window cannot exceed frame.
-        if (zw > (float)width) zw = (float)width;
-        if (zw < 1.0f) zw = 1.0f;
+	useTrackingScaleFilter = true;
+	trackingScaleOutW = std::max(1, (int)std::lround(baseZw));
+	trackingScaleOutH = std::max(1, (int)std::lround(baseZh));
+	const float baseMaxZX = std::max(0.0f, (float)width - baseZw);
+	const float targetCenterX = boundingBox.x + (boundingBox.width * 0.5f);
 
-        // Choose target X based on preset (manual left/center/right or auto-follow group).
-        float maxZX = (float)width - zw;
-        if (maxZX < 0.0f) maxZX = 0.0f;
+	float baseZx = 0.0f;
+	if (tf->x_pan_preset == "left") {
+		baseZx = 0.0f;
+	} else if (tf->x_pan_preset == "right") {
+		baseZx = baseMaxZX;
+	} else if (tf->x_pan_preset == "center") {
+		baseZx = baseMaxZX * 0.5f;
+	} else if (tf->x_pan_preset == "autosnap" || tf->x_pan_preset == "autosnap_smooth") {
+		float norm = (width > 0) ? (targetCenterX / (float)width) : 0.5f;
+		float h = std::clamp(tf->x_snap_hysteresis, 0.0f, 0.20f);
+		const float t1 = 1.0f / 3.0f;
+		const float t2 = 2.0f / 3.0f;
 
-        if (tf->x_pan_preset == "left") {
-                zx = 0.0f;
-        } else if (tf->x_pan_preset == "right") {
-                zx = maxZX;
-        } else if (tf->x_pan_preset == "center") {
-                zx = maxZX * 0.5f;
-	        } else if (tf->x_pan_preset == "autosnap" || tf->x_pan_preset == "autosnap_smooth") {
-	                // Auto-snap between Left/Center/Right with hysteresis to avoid micro-movements.
-                float targetCenterX = boundingBox.x + (boundingBox.width * 0.5f);
-                float norm = (width > 0) ? (targetCenterX / (float)width) : 0.5f;
-                float h = tf->x_snap_hysteresis;
-                if (h < 0.0f) h = 0.0f;
-                if (h > 0.20f) h = 0.20f;
-                const float t1 = 1.0f / 3.0f;
-                const float t2 = 2.0f / 3.0f;
+		const int prev_state = tf->x_snap_state;
+		switch (tf->x_snap_state) {
+		case 0:
+			if (norm > t1 + h)
+				tf->x_snap_state = 1;
+			break;
+		case 2:
+			if (norm < t2 - h)
+				tf->x_snap_state = 1;
+			break;
+		case 1:
+		default:
+			if (norm < t1 - h)
+				tf->x_snap_state = 0;
+			else if (norm > t2 + h)
+				tf->x_snap_state = 2;
+			break;
+		}
 
-	                // Update snap state with hysteresis.
-	                const int prev_state = tf->x_snap_state;
-	                switch (tf->x_snap_state) {
-                case 0: // left
-                        if (norm > t1 + h) tf->x_snap_state = 1;
-                        break;
-                case 2: // right
-                        if (norm < t2 - h) tf->x_snap_state = 1;
-                        break;
-                case 1: // center
-                default:
-                        if (norm < t1 - h) tf->x_snap_state = 0;
-                        else if (norm > t2 + h) tf->x_snap_state = 2;
-                        break;
-                }
+		baseZx = (tf->x_snap_state == 0) ? 0.0f : (tf->x_snap_state == 2) ? baseMaxZX : (baseMaxZX * 0.5f);
 
-	                // Target position for this snap state.
-	                float targetZX = (tf->x_snap_state == 0) ? 0.0f : (tf->x_snap_state == 2) ? maxZX : (maxZX * 0.5f);
-	                zx = targetZX;
+		if (tf->x_pan_preset == "autosnap") {
+			tf->trackVelX = 0.0f;
+		} else if (tf->x_snap_state != prev_state) {
+			tf->trackVelX = 0.0f;
+		}
+	} else {
+		// Auto: pan the base 16:9 window on the group's X center.
+		baseZx = targetCenterX - (baseZw * 0.5f);
+	}
+	baseZx = std::clamp(baseZx, 0.0f, baseMaxZX);
 
-	                if (tf->x_pan_preset == "autosnap") {
-	                        // Hard snap: kill residual velocity every frame so it truly "snaps".
-	                        tf->trackVelX = 0.0f;
-	                } else {
-	                        // Smooth snap: only reset velocity when we change lane, to get a clean 200-300ms move.
-	                        if (tf->x_snap_state != prev_state)
-	                                tf->trackVelX = 0.0f;
-	                }
-        } else {
-                // Auto: center the window on the group's center X.
-                float targetCenterX = boundingBox.x + (boundingBox.width * 0.5f);
-                zx = targetCenterX - (zw * 0.5f);
-        }
-        zy = 0.0f;
+	float targetEdgeZoom = 1.0f;
+	if (tf->groupEdgeZoomEnabled && finalGroupClusterValid && width > 0) {
+		const float groupCenterX = boundingBox.x + boundingBox.width * 0.5f;
+		const float normX = std::clamp(groupCenterX / (float)width, 0.0f, 1.0f);
+		const float edge01 = std::clamp(std::fabs(normX * 2.0f - 1.0f), 0.0f, 1.0f);
+		const float curved = std::pow(edge01, tf->groupEdgeZoomCurve);
+		targetEdgeZoom = std::clamp(1.0f + ((tf->groupEdgeZoomAmount - 1.0f) * curved), 1.0f, 4.0f);
+	}
 
-        // End-stops (fine corsa): clamp within [0, width-zw]
-        if (zx < 0.0f) zx = 0.0f;
-        if (zx > maxZX) zx = maxZX;
+	// Smooth the real zoom multiplier itself so the crop size never jumps when entering/leaving the sides.
+	// targetEdgeZoom/value: 1.0 = no extra zoom, 4.0 = 4x real 2D zoom.
+	tf->groupEdgeZoomValue = smooth_damp_critically_damped(tf->groupEdgeZoomValue, targetEdgeZoom,
+								tf->groupEdgeZoomVel, tf->groupEdgeZoomSmooth, seconds);
+	tf->groupEdgeZoomValue = std::clamp(tf->groupEdgeZoomValue, 1.0f, 4.0f);
+
+	const float zoomScale = 1.0f / tf->groupEdgeZoomValue;
+	zw = std::clamp(baseZw * zoomScale, 1.0f, baseZw);
+	zh = std::clamp(baseZh * zoomScale, 1.0f, baseZh);
+
+	// Extra zoom is centered horizontally inside the current 16:9 pan window.
+	// This avoids changing the meaning of left/center/right end-stops while still producing real zoom.
+	zx = baseZx + (baseZw - zw) * 0.5f;
+
+	// Vertical zoom is NOT driven by YOLO bbox Y. Keep the court/floor stable.
+	// 0.50 = crop top/bottom equally. 0.65 = crop more from top and preserve more bottom/floor.
+	// Preserve the court/floor: crop mostly from the top, minimally from the bottom.
+	const float verticalTopShare = 0.85f;
+	zy = (baseZh - zh) * verticalTopShare;
+
+	const float maxZX = std::max(0.0f, (float)width - zw);
+	const float maxZY = std::max(0.0f, (float)height - zh);
+	zx = std::clamp(zx, 0.0f, maxZX);
+	zy = std::clamp(zy, 0.0f, maxZY);
 } else {
         // calculate an aspect ratio box around the object using its height
         float boxHeight = boundingBox.height;
@@ -1941,24 +2087,19 @@ if (tf->zoomObject == "group") {
 	const float smoothTime = smooth_time_from_alpha60(alpha60);
 
 	if (tf->zoomObject == "group") {
-		// Pan-only X: smooth only the horizontal movement.
-			float smoothTimeX = smoothTime;
-			// Auto-snap (smooth): use an explicit transition time so moves take ~200-300ms regardless of FPS.
-			if (tf->x_pan_preset == "autosnap_smooth") {
-				smoothTimeX = std::clamp(tf->x_snap_transition_time, 0.05f, 1.0f);
-			}
-			tf->trackingRect.x = smooth_damp_critically_damped(tf->trackingRect.x, zx, tf->trackVelX,
+		float smoothTimeX = smoothTime;
+		if (tf->x_pan_preset == "autosnap_smooth")
+			smoothTimeX = std::clamp(tf->x_snap_transition_time, 0.05f, 1.0f);
+
+		// Group mode now supports real 2D edge zoom: smooth X, Y, W and H.
+		tf->trackingRect.x = smooth_damp_critically_damped(tf->trackingRect.x, zx, tf->trackVelX,
 							   smoothTimeX, seconds);
-
-		// Keep fixed size and full height; no vertical movement.
-		tf->trackingRect.y = zy;
-		tf->trackingRect.width = zw;
-		tf->trackingRect.height = zh;
-
-		// Avoid accumulating velocities on unused axes.
-		tf->trackVelY = 0.0f;
-		tf->trackVelW = 0.0f;
-		tf->trackVelH = 0.0f;
+		tf->trackingRect.y = smooth_damp_critically_damped(tf->trackingRect.y, zy, tf->trackVelY,
+							   smoothTime, seconds);
+		tf->trackingRect.width =
+			smooth_damp_critically_damped(tf->trackingRect.width, zw, tf->trackVelW, smoothTime, seconds);
+		tf->trackingRect.height =
+			smooth_damp_critically_damped(tf->trackingRect.height, zh, tf->trackVelH, smoothTime, seconds);
 	} else {
 		tf->trackingRect.x = smooth_damp_critically_damped(tf->trackingRect.x, zx, tf->trackVelX,
 							   smoothTime, seconds);
@@ -1991,9 +2132,24 @@ if (tf->zoomObject == "group") {
 			obs_data_set_int(crop_pad_settings, "right", std::max(0, right));
 			obs_data_set_int(crop_pad_settings, "bottom", std::max(0, bottom));
 
-			// apply the settings
+			// apply the crop settings
                 obs_source_update(tf->trackingFilter, crop_pad_settings);
                 obs_data_release(crop_pad_settings);
+
+			// Group 2D edge zoom must scale the smaller crop back to the base
+			// 16:9 window. Without this filter OBS only receives a smaller source,
+			// which appears as cut sides/base instead of optical zoom.
+			if (tf->trackingScaleFilter) {
+				obs_source_set_enabled(tf->trackingScaleFilter, useTrackingScaleFilter);
+				if (useTrackingScaleFilter && trackingScaleOutW > 0 && trackingScaleOutH > 0) {
+					char resolution[64];
+					snprintf(resolution, sizeof(resolution), "%dx%d", trackingScaleOutW, trackingScaleOutH);
+					obs_data_t *scale_settings = obs_source_get_settings(tf->trackingScaleFilter);
+					obs_data_set_string(scale_settings, "resolution", resolution);
+					obs_source_update(tf->trackingScaleFilter, scale_settings);
+					obs_data_release(scale_settings);
+				}
+			}
         }
 }
 
