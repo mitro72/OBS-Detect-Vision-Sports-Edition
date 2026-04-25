@@ -1,4 +1,4 @@
-# OBS-Detect Vision – Sports Edition (Safe ROI) – v5.0.1
+# OBS-Detect Vision – Sports Edition (zoom) – v5.3.0
 
 This bundle contains the **updated `detect-filter.cpp`** for the *Safe ROI + Group clustering* workflow.
 
@@ -12,6 +12,7 @@ This bundle contains the **updated `detect-filter.cpp`** for the *Safe ROI + Gro
 - **Auto-snap velocity reset cleanup** (removed redundant resets).
 - **Clustering allocation/perf tweaks** (reused buffers; less per-frame churn).
 - **Better cluster selection for basketball:** choose **highest people count first**, then **largest area**.
+- **zoom 
 
 ## Settings recap (Tracking group)
 
