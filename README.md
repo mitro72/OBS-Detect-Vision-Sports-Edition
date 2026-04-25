@@ -12,7 +12,7 @@ This bundle contains the **updated `detect-filter.cpp`** for the *Safe ROI + Gro
 - **Auto-snap velocity reset cleanup** (removed redundant resets).
 - **Clustering allocation/perf tweaks** (reused buffers; less per-frame churn).
 - **Better cluster selection for basketball:** choose **highest people count first**, then **largest area**.
-- **zoom 
+- configurable zoom 
 
 ## Settings recap (Tracking group)
 
