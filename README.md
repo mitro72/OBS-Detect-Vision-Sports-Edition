@@ -5,7 +5,7 @@ This bundle contains the **updated `detect-filter.cpp`** for the *Safe ROI + Gro
 > Note: this ZIP is a **source patch bundle** (it does not include the full repository tree).  
 > Drop `src/detect-filter.cpp` into your repo (OpenVINO branch / Windows build) replacing the existing file.
 
-## What changed in v5.0.1
+## What changed in v5.3.0
 
 - **Preview group clusters now uses `groupMaxDistFrac`** (same value as the crop logic).
 - **Removed duplicated Safe ROI defaults** in `detect_filter_defaults()`.
